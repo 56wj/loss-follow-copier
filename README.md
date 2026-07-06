@@ -74,6 +74,7 @@
 远程版的主要保护：
 
 - 发送端写入源单稳定 ID、票号、品种、方向、手数、开仓价、SL/TP、魔术号和注释。
+- 发送端默认 `InpPauseWhenAutoTradingOff = true`。源端自动交易关闭时，会暂停发布有效快照，接收端不会继续用旧文件开新跟单。
 - 接收端跟单注释使用 `RLFC:源ID:L档位`，不和本地版 `LFC:` 混用。
 - `InpSourceStaleSeconds` 用于快照过期保护。快照过期时，接收端不会新开单，也不会把“读不到快照”误判成源单平仓。
 - 接收端支持 `InpSymbolMap` 品种映射，例如源账号是 `XAUUSD`、跟单账号是 `XAUUSDm`，填写 `XAUUSD=XAUUSDm`。

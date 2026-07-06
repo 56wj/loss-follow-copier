@@ -10,6 +10,7 @@ input group "发送通道"
 input string InpChannelName     = "loss_follow_1"; // 通道名称，接收端必须填写同一个名称
 input string InpAllowedSymbols  = "";              // 导出品种，多个用;或,分隔，空表示全部
 input int    InpScanIntervalMs  = 300;             // 快照刷新间隔，单位毫秒
+input bool   InpPauseWhenAutoTradingOff = true;    // 自动交易关闭时暂停发布源单快照
 input bool   InpPrintDebug      = true;            // 打印调试日志
 
 string g_file_name;
@@ -55,6 +56,12 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
 void WriteSnapshot()
 {
+   if(InpPauseWhenAutoTradingOff && !IsAlgoTradingAllowed())
+   {
+      WritePausedSnapshot();
+      return;
+   }
+
    int handle = FileOpen(g_file_name,
                          FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                          '\t');
@@ -116,6 +123,41 @@ void WriteSnapshot()
                   exported,
                   InpChannelName);
    }
+}
+
+void WritePausedSnapshot()
+{
+   int handle = FileOpen(g_file_name,
+                         FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         '\t');
+   if(handle == INVALID_HANDLE)
+   {
+      PrintFormat("Open paused snapshot file failed. file=%s error=%d", g_file_name, GetLastError());
+      return;
+   }
+
+   long login = AccountInfoInteger(ACCOUNT_LOGIN);
+   string server = AccountInfoString(ACCOUNT_SERVER);
+
+   FileWrite(handle, "META", "RLFC1", InpChannelName, login, server, 0);
+   FileWrite(handle, "PAUSED", "auto_trading_disabled");
+   FileWrite(handle, "END", 0, 0);
+   FileClose(handle);
+
+   datetime now = TimeLocal();
+   if(InpPrintDebug && now != g_last_print_time)
+   {
+      g_last_print_time = now;
+      PrintFormat("Remote snapshot paused. file=%s reason=auto_trading_disabled channel=%s",
+                  g_file_name,
+                  InpChannelName);
+   }
+}
+
+bool IsAlgoTradingAllowed()
+{
+   return (bool)TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) &&
+          (bool)MQLInfoInteger(MQL_TRADE_ALLOWED);
 }
 
 string SnapshotFileName()
