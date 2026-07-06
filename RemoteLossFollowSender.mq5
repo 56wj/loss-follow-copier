@@ -56,7 +56,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 void WriteSnapshot()
 {
    int handle = FileOpen(g_file_name,
-                         FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_UNICODE,
+                         FILE_WRITE | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                          '\t');
    if(handle == INVALID_HANDLE)
    {

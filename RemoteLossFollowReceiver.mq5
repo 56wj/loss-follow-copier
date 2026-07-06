@@ -187,6 +187,7 @@ input bool               InpEA2GridStopAfterBasketClose = true;  // 网格模式
 input group "跟单EA全局设置"
 input ulong              InpCopyMagic            = 2026062301;   // 跟单EA魔术号，必须和源EA不同
 input int                InpDeviationPoints      = 100;          // 允许滑点，单位为券商点数
+input string             InpSymbolMap            = "";           // 品种映射，源=跟单；多个用;分隔，例如 XAUUSD=XAUUSDm
 input bool               InpCloseCopyWithSource  = true;         // 源单平仓后跟单一起市价平仓
 input int                InpCloseRetrySeconds    = 3;            // 同一跟单平仓失败后的重试间隔秒数
 input bool               InpOneCopyPerPosition   = true;         // 每个源单只跟一次
@@ -536,12 +537,12 @@ void CheckPositions()
    for(int i = total - 1; i >= 0; i--)
    {
       RemoteSourcePosition source = g_sources[i];
-      string symbol = source.symbol;
+      string source_symbol = source.symbol;
       string comment = source.comment;
       long magic = source.magic;
 
       SourceProfile profile;
-      if(!MatchSourceProfile(symbol, magic, comment, profile))
+      if(!MatchSourceProfile(source_symbol, magic, comment, profile))
          continue;
 
       if(profile.entry_mode == ENTRY_GRID_ACTIVATION)
@@ -591,6 +592,16 @@ void ProcessGridGroup(const SourceProfile& profile,
                       const string symbol,
                       const ENUM_POSITION_TYPE position_type)
 {
+   string local_symbol = LocalSymbolForSource(symbol);
+   if(!EnsureSymbolReady(local_symbol))
+   {
+      PrintFormat("Skip grid group: local symbol is not available. source_symbol=%s local_symbol=%s profile=EA%d",
+                  symbol,
+                  local_symbol,
+                  profile.profile_index);
+      return;
+   }
+
    int source_count = 0;
    double source_volume = 0.0;
    double weighted_open = 0.0;
@@ -601,14 +612,14 @@ void ProcessGridGroup(const SourceProfile& profile,
       return;
 
    double avg_open = weighted_open / source_volume;
-   double loss_points = FloatingLossPoints(symbol, position_type, avg_open);
-   double loss_price = loss_points * SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double loss_points = FloatingLossPoints(local_symbol, position_type, avg_open);
+   double loss_price = loss_points * SymbolInfoDouble(local_symbol, SYMBOL_POINT);
    bool active = IsGridGroupActive(profile.profile_index, symbol, position_type);
    bool triggered = IsLossTriggered(loss_points, loss_price, profile, 1);
 
    if(active)
    {
-      int copy_count = CopyGroupCount(profile.profile_index, symbol, position_type);
+      int copy_count = CopyGroupCount(profile.profile_index, local_symbol, position_type);
       if(copy_count == 0 && !triggered)
       {
          ClearGridGroupActive(profile.profile_index, symbol, position_type);
@@ -633,11 +644,11 @@ void ProcessGridGroup(const SourceProfile& profile,
                      loss_price);
       }
 
-      CopyGridSources(profile, symbol, position_type, true, loss_points, loss_price);
+      CopyGridSources(profile, symbol, local_symbol, position_type, true, loss_points, loss_price);
       return;
    }
 
-   CopyGridSources(profile, symbol, position_type, false, loss_points, loss_price);
+   CopyGridSources(profile, symbol, local_symbol, position_type, false, loss_points, loss_price);
 }
 
 bool SourceGroupStats(const SourceProfile& profile,
@@ -693,6 +704,7 @@ bool IsSourcePositionForProfile(const SourceProfile& profile, const RemoteSource
 
 void CopyGridSources(const SourceProfile& profile,
                      const string symbol,
+                     const string local_symbol,
                      const ENUM_POSITION_TYPE position_type,
                      const bool initial_activation,
                      const double group_loss_points,
@@ -722,13 +734,24 @@ void CopyGridSources(const SourceProfile& profile,
          return;
 
       double source_volume = source.volume;
-      double volume = CalculateCopyVolume(symbol, source_volume, profile, 1);
+      double volume = CalculateCopyVolume(local_symbol, source_volume, profile, 1);
       if(volume <= 0.0)
+      {
+         PrintFormat("Skip grid source #%I64u: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f fixed_lot=%.8f min=%.8f max=%.8f step=%.8f",
+                     source_ticket,
+                     symbol,
+                     local_symbol,
+                     source_volume,
+                     LevelFixedLot(profile, 1),
+                     SymbolInfoDouble(local_symbol, SYMBOL_VOLUME_MIN),
+                     SymbolInfoDouble(local_symbol, SYMBOL_VOLUME_MAX),
+                     SymbolInfoDouble(local_symbol, SYMBOL_VOLUME_STEP));
          continue;
+      }
 
       double source_sl = source.sl;
       double source_tp = source.tp;
-      if(OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
+      if(OpenCopyTrade(source_ticket, local_symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
       {
          MarkCopied(source_ticket, 1);
          copied_now++;
@@ -783,7 +806,18 @@ void ProcessSourceLevel(const RemoteSourcePosition& source, const SourceProfile&
    if((profile.entry_mode == ENTRY_PENDING_AT_TRIGGER || InpOneCopyPerPosition) && IsAlreadyCopied(source_ticket, level_index))
       return;
 
-   string symbol = source.symbol;
+   string source_symbol = source.symbol;
+   string symbol = LocalSymbolForSource(source_symbol);
+   if(!EnsureSymbolReady(symbol))
+   {
+      PrintFormat("Skip source #%I64u L%d: local symbol is not available. source_symbol=%s local_symbol=%s",
+                  source_ticket,
+                  level_index,
+                  source_symbol,
+                  symbol);
+      return;
+   }
+
    ENUM_POSITION_TYPE position_type = source.position_type;
    if(position_type != POSITION_TYPE_BUY && position_type != POSITION_TYPE_SELL)
       return;
@@ -796,7 +830,16 @@ void ProcessSourceLevel(const RemoteSourcePosition& source, const SourceProfile&
    double volume = CalculateCopyVolume(symbol, source_volume, profile, level_index);
    if(volume <= 0.0)
    {
-      PrintFormat("Skip source #%I64u L%d: calculated copy volume is invalid.", source_ticket, level_index);
+      PrintFormat("Skip source #%I64u L%d: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f fixed_lot=%.8f min=%.8f max=%.8f step=%.8f",
+                  source_ticket,
+                  level_index,
+                  source_symbol,
+                  symbol,
+                  source_volume,
+                  LevelFixedLot(profile, level_index),
+                  SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN),
+                  SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX),
+                  SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP));
       return;
    }
 
@@ -1447,8 +1490,55 @@ bool IsCopyPosition()
    return (ulong)magic == InpCopyMagic || magic == 0;
 }
 
+string LocalSymbolForSource(const string source_symbol)
+{
+   string mappings = InpSymbolMap;
+   StringReplace(mappings, " ", "");
+   StringReplace(mappings, ",", ";");
+
+   if(mappings == "")
+      return source_symbol;
+
+   string entries[];
+   int entry_count = StringSplit(mappings, ';', entries);
+   for(int i = 0; i < entry_count; i++)
+   {
+      if(entries[i] == "")
+         continue;
+
+      string pair[];
+      int pair_count = StringSplit(entries[i], '=', pair);
+      if(pair_count != 2)
+         continue;
+
+      if(pair[0] == source_symbol && pair[1] != "")
+         return pair[1];
+   }
+
+   return source_symbol;
+}
+
+bool EnsureSymbolReady(const string symbol)
+{
+   if(symbol == "")
+      return false;
+
+   if(!SymbolSelect(symbol, true))
+      return false;
+
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   double min_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double max_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+
+   return point > 0.0 && min_volume > 0.0 && max_volume > 0.0 && step > 0.0;
+}
+
 double FloatingLossPoints(const string symbol, const ENUM_POSITION_TYPE position_type, const double open_price)
 {
+   if(!EnsureSymbolReady(symbol))
+      return 0.0;
+
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    if(point <= 0.0)
       return 0.0;
@@ -1464,6 +1554,9 @@ double FloatingLossPoints(const string symbol, const ENUM_POSITION_TYPE position
 
 double FloatingProfitPoints(const string symbol, const ENUM_POSITION_TYPE position_type, const double open_price)
 {
+   if(!EnsureSymbolReady(symbol))
+      return 0.0;
+
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    if(point <= 0.0)
       return 0.0;
@@ -1491,6 +1584,9 @@ double CalculateCopyVolume(const string symbol, const double source_volume, cons
 
 double NormalizeVolume(const string symbol, const double volume)
 {
+   if(!EnsureSymbolReady(symbol))
+      return 0.0;
+
    double min_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double max_volume = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double step = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
@@ -1902,7 +1998,7 @@ bool LoadRemoteSnapshot()
    bool complete = false;
 
    int handle = FileOpen(g_snapshot_file,
-                         FILE_READ | FILE_CSV | FILE_COMMON | FILE_UNICODE,
+                         FILE_READ | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ | FILE_SHARE_WRITE,
                          '\t');
    if(handle == INVALID_HANDLE)
    {
