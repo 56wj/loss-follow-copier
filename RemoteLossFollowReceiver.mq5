@@ -1987,13 +1987,14 @@ bool LoadRemoteSnapshot()
 
    g_snapshot_time = snapshot_time;
    g_have_snapshot = true;
-   g_snapshot_fresh = (TimeCurrent() - g_snapshot_time) <= InpSourceStaleSeconds;
+   int snapshot_age = (int)(TimeLocal() - g_snapshot_time);
+   g_snapshot_fresh = snapshot_age >= 0 && snapshot_age <= InpSourceStaleSeconds;
 
    if(InpPrintDebug && !g_snapshot_fresh)
    {
       PrintFormat("Remote snapshot is stale. file=%s age=%d seconds limit=%d",
                   g_snapshot_file,
-                  (int)(TimeCurrent() - g_snapshot_time),
+                  snapshot_age,
                   InpSourceStaleSeconds);
    }
 

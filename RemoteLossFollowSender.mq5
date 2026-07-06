@@ -66,7 +66,7 @@ void WriteSnapshot()
 
    long login = AccountInfoInteger(ACCOUNT_LOGIN);
    string server = AccountInfoString(ACCOUNT_SERVER);
-   datetime now = TimeCurrent();
+   datetime now = TimeLocal();
 
    FileWrite(handle, "META", "RLFC1", InpChannelName, login, server, (long)now);
 
