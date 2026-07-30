@@ -172,9 +172,12 @@ input bool               InpCloseCopyWithSource  = true;         // 源单平仓
 input int                InpCloseRetrySeconds    = 3;            // 同一跟单平仓失败后的重试间隔秒数
 input bool               InpOneCopyPerPosition   = true;         // 每个源单只跟一次
 input int                InpScanIntervalMs       = 500;          // 轮询扫描间隔，单位毫秒
+input bool               InpBeijingFirstEntryTimeFilterEnabled = false; // 启用跟单首单北京时间过滤
+input string             InpBeijingFirstEntryTimeFilterRanges  = "04:00-10:00,18:00-23:30"; // 跟单空仓时禁止开首单的北京时间区间
 input bool               InpPrintDebug           = true;         // 打印调试日志
 
 string g_prefix;
+datetime g_last_first_entry_time_filter_log = 0;
 
 void LoadProfile(const int index, SourceProfile& profile)
 {
@@ -433,6 +436,9 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
+   if(!ValidateBeijingFirstEntryTimeFilter())
+      return INIT_PARAMETERS_INCORRECT;
+
    g_prefix = "LFC_" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_";
 
    ENUM_ACCOUNT_MARGIN_MODE margin_mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
@@ -482,6 +488,7 @@ void CheckPositions()
    ResetInactiveGridGroups();
    CheckMinuteProfitClose();
    CheckBasketProfitClose();
+   ApplyFirstEntryTimeFilter();
    CheckGridActivationEntries();
 
    int total = PositionsTotal();
@@ -590,6 +597,12 @@ void ProcessGridGroup(const SourceProfile& profile,
    {
       if(!triggered)
          return;
+
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(0, symbol, 1, "grid activation");
+         return;
+      }
 
       SetGridGroupActive(profile.profile_index, symbol, position_type);
       if(InpPrintDebug)
@@ -715,6 +728,12 @@ void CopyGridSources(const SourceProfile& profile,
 
       double source_sl = PositionGetDouble(POSITION_SL);
       double source_tp = PositionGetDouble(POSITION_TP);
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(source_ticket, symbol, 1, "grid copy");
+         return;
+      }
+
       if(OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
       {
          MarkCopied(source_ticket, 1);
@@ -796,12 +815,24 @@ void ProcessSourceLevel(const ulong source_ticket, const SourceProfile& profile,
 
    if(profile.entry_mode == ENTRY_PENDING_AT_TRIGGER)
    {
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(source_ticket, symbol, level_index, "pending");
+         return;
+      }
+
       PlaceCopyPending(source_ticket, symbol, position_type, source_open_price, volume, source_sl, source_tp, profile, level_index);
       return;
    }
 
    if(!IsLossTriggered(loss_points, loss_price, profile, level_index))
       return;
+
+   if(IsFirstCopyEntryTimeBlocked())
+   {
+      LogFirstEntryTimeFilterSkip(source_ticket, symbol, level_index, "market");
+      return;
+   }
 
    if(OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, loss_points, loss_price, profile, level_index))
       MarkCopied(source_ticket, level_index);
@@ -913,6 +944,239 @@ bool IsLossTriggered(const double loss_points, const double loss_price, const So
       return loss_price >= LevelLossPrice(profile, level_index);
 
    return loss_points >= LevelLossPoints(profile, level_index);
+}
+
+bool ValidateBeijingFirstEntryTimeFilter()
+{
+   if(!InpBeijingFirstEntryTimeFilterEnabled)
+      return true;
+
+   if(!ValidateTimeRanges(InpBeijingFirstEntryTimeFilterRanges))
+   {
+      Print("InpBeijingFirstEntryTimeFilterRanges format must be like 04:00-10:00,18:00-23:30.");
+      return false;
+   }
+
+   return true;
+}
+
+string NormalizeTimeRanges(string ranges)
+{
+   StringReplace(ranges, " ", "");
+   StringReplace(ranges, "\t", "");
+   StringReplace(ranges, "，", ";");
+   StringReplace(ranges, "；", ";");
+   StringReplace(ranges, ",", ";");
+   return ranges;
+}
+
+bool IsDigitString(const string text)
+{
+   int length = StringLen(text);
+   if(length <= 0)
+      return false;
+
+   for(int i = 0; i < length; i++)
+   {
+      ushort ch = StringGetCharacter(text, i);
+      if(ch < 48 || ch > 57)
+         return false;
+   }
+
+   return true;
+}
+
+bool ParseClockMinute(const string text, int& minute_of_day)
+{
+   int colon_pos = StringFind(text, ":");
+   if(colon_pos <= 0 || colon_pos >= StringLen(text) - 1)
+      return false;
+
+   string hour_text = StringSubstr(text, 0, colon_pos);
+   string minute_text = StringSubstr(text, colon_pos + 1);
+   if(!IsDigitString(hour_text) || !IsDigitString(minute_text))
+      return false;
+
+   int hour = (int)StringToInteger(hour_text);
+   int minute = (int)StringToInteger(minute_text);
+   if(hour < 0 || hour > 24 || minute < 0 || minute > 59)
+      return false;
+
+   if(hour == 24 && minute != 0)
+      return false;
+
+   minute_of_day = hour * 60 + minute;
+   return true;
+}
+
+bool ParseTimeRange(const string range_text, int& start_minute, int& end_minute)
+{
+   int dash_pos = StringFind(range_text, "-");
+   if(dash_pos <= 0 || dash_pos >= StringLen(range_text) - 1)
+      return false;
+
+   if(StringFind(range_text, "-", dash_pos + 1) >= 0)
+      return false;
+
+   string start_text = StringSubstr(range_text, 0, dash_pos);
+   string end_text = StringSubstr(range_text, dash_pos + 1);
+   return ParseClockMinute(start_text, start_minute) &&
+          ParseClockMinute(end_text, end_minute);
+}
+
+bool ValidateTimeRanges(string ranges)
+{
+   ranges = NormalizeTimeRanges(ranges);
+   if(ranges == "")
+      return false;
+
+   string parts[];
+   int count = StringSplit(ranges, ';', parts);
+   if(count <= 0)
+      return false;
+
+   bool has_range = false;
+   for(int i = 0; i < count; i++)
+   {
+      if(parts[i] == "")
+         continue;
+
+      int start_minute = 0;
+      int end_minute = 0;
+      if(!ParseTimeRange(parts[i], start_minute, end_minute))
+         return false;
+
+      has_range = true;
+   }
+
+   return has_range;
+}
+
+bool IsMinuteInRange(const int minute_of_day, const int start_minute, const int end_minute)
+{
+   if(start_minute == end_minute)
+      return true;
+
+   if(start_minute < end_minute)
+      return minute_of_day >= start_minute && minute_of_day < end_minute;
+
+   return minute_of_day >= start_minute || minute_of_day < end_minute;
+}
+
+bool IsMinuteInTimeRanges(const int minute_of_day, string ranges)
+{
+   ranges = NormalizeTimeRanges(ranges);
+   if(ranges == "")
+      return false;
+
+   string parts[];
+   int count = StringSplit(ranges, ';', parts);
+   for(int i = 0; i < count; i++)
+   {
+      if(parts[i] == "")
+         continue;
+
+      int start_minute = 0;
+      int end_minute = 0;
+      if(!ParseTimeRange(parts[i], start_minute, end_minute))
+         continue;
+
+      if(IsMinuteInRange(minute_of_day, start_minute, end_minute))
+         return true;
+   }
+
+   return false;
+}
+
+int BeijingMinuteOfDay()
+{
+   datetime beijing_time = TimeGMT() + 8 * 60 * 60;
+   MqlDateTime now;
+   TimeToStruct(beijing_time, now);
+   return now.hour * 60 + now.min;
+}
+
+bool IsBeijingFirstEntryFilterTime()
+{
+   return IsMinuteInTimeRanges(BeijingMinuteOfDay(), InpBeijingFirstEntryTimeFilterRanges);
+}
+
+bool HasOpenCopyPositions()
+{
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+
+      if(IsCopyPosition())
+         return true;
+   }
+
+   return false;
+}
+
+bool IsFirstCopyEntryTimeBlocked()
+{
+   if(!InpBeijingFirstEntryTimeFilterEnabled)
+      return false;
+
+   if(HasOpenCopyPositions())
+      return false;
+
+   return IsBeijingFirstEntryFilterTime();
+}
+
+string BeijingTimeFilterNowText()
+{
+   datetime beijing_time = TimeGMT() + 8 * 60 * 60;
+   MqlDateTime now;
+   TimeToStruct(beijing_time, now);
+   return StringFormat("%02d:%02d", now.hour, now.min);
+}
+
+void LogFirstEntryTimeFilterSkip(const ulong source_ticket,
+                                 const string symbol,
+                                 const int level_index,
+                                 const string action)
+{
+   if(!InpPrintDebug)
+      return;
+
+   datetime now = TimeGMT();
+   if(g_last_first_entry_time_filter_log > 0 &&
+      now - g_last_first_entry_time_filter_log < 60)
+      return;
+
+   g_last_first_entry_time_filter_log = now;
+   PrintFormat("First copy entry blocked by Beijing time filter. action=%s source=%I64u level=L%d symbol=%s beijing=%s ranges=%s",
+               action,
+               source_ticket,
+               level_index,
+               symbol,
+               BeijingTimeFilterNowText(),
+               InpBeijingFirstEntryTimeFilterRanges);
+}
+
+void ApplyFirstEntryTimeFilter()
+{
+   if(!IsFirstCopyEntryTimeBlocked())
+      return;
+
+   int total = OrdersTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket == 0 || !OrderSelect(order_ticket))
+         continue;
+
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+         continue;
+
+      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      DeleteCopyPending(order_ticket, source_ticket);
+   }
 }
 
 void CheckMinuteProfitClose()
@@ -1718,7 +1982,7 @@ bool DeleteCopyPending(const ulong order_ticket, const ulong source_ticket)
    }
 
    if(InpPrintDebug)
-      PrintFormat("Pending copy deleted with source. order=%I64u source=%I64u", order_ticket, source_ticket);
+      PrintFormat("Pending copy deleted. order=%I64u source=%I64u", order_ticket, source_ticket);
 
    return true;
 }
