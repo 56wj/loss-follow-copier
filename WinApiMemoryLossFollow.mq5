@@ -3,8 +3,8 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
-#property description "Windows内置API共享内存跟单：单EA切换角色，无自定义DLL。"
+#property version   "1.10"
+#property description "Windows API共享内存跟单：统一角色切换，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
 long CreateFileMappingW(long file_handle, long security_attributes, uint protect, uint maximum_size_high, uint maximum_size_low, string object_name);
@@ -244,6 +244,13 @@ input bool               InpBeijingFirstEntryTimeFilterEnabled = false; // 启�
 input string             InpBeijingFirstEntryTimeFilterRanges  = "04:00-10:00,18:00-23:30"; // 跟单空仓时禁止开首单的北京时间区间
 input bool               InpPrintDebug           = false;        // 打印调试日志；追求速度时关闭
 
+input group "图表跟单面板（仅Receiver）"
+input bool               InpShowPanel            = true;         // 在Receiver图表显示内嵌跟单面板
+input ENUM_BASE_CORNER   InpPanelCorner          = CORNER_LEFT_UPPER; // 面板所在角落
+input int                InpPanelX               = 10;           // 面板水平偏移
+input int                InpPanelY               = 20;           // 面板垂直偏移
+input int                InpPanelRefreshMs       = 250;          // 面板刷新周期，最低100毫秒
+
 string g_prefix;
 int g_memory_capacity_bytes = 0;
 uchar g_memory_buffer[];
@@ -263,6 +270,12 @@ ulong g_last_memory_read_tick_ms = 0;
 datetime g_last_memory_error_log = 0;
 datetime g_last_snapshot_latency_log = 0;
 datetime g_last_first_entry_time_filter_log = 0;
+ulong g_panel_last_update_tick_ms = 0;
+string g_panel_object_prefix = "";
+bool g_panel_entries_paused = false;
+string g_panel_confirm_action = "";
+ulong g_panel_confirm_until_tick_ms = 0;
+string g_panel_last_action = "就绪";
 ulong g_sender_sequence = 0;
 datetime g_last_debug_print = 0;
 datetime g_last_error_print = 0;
@@ -904,6 +917,8 @@ int InitMemoryReceiver()
               IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               SanitizeNamePart(InpChannelName) + "_";
 
+   PanelInitialize();
+
    ENUM_ACCOUNT_MARGIN_MODE margin_mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
    if(margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
       Print("Warning: this EA is designed for hedging accounts. On netting accounts, source and copy positions may merge.");
@@ -917,6 +932,8 @@ int InitMemoryReceiver()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   if(PanelRoleIsReceiver())
+      PanelDestroy();
    if(g_winapi_view_address != 0)
    {
       if(InpMemoryRole == MEMORY_FOLLOW_SENDER)
@@ -939,6 +956,14 @@ void OnTimer()
       CheckPositions();
 }
 
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   PanelHandleChartEvent(id, sparam);
+}
+
 void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
@@ -955,6 +980,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       DeletePendingsWithoutSource();
       ResetInactiveGridGroups();
    }
+   PanelUpdate(true);
 }
 
 void SenderWriteSnapshot()
@@ -1116,9 +1142,431 @@ bool IsAlgoTradingAllowed()
 }
 
 
+
+bool PanelRoleIsReceiver()
+{
+   return InpMemoryRole == MEMORY_FOLLOW_RECEIVER;
+}
+
+string PanelTransportName()
+{
+   return "共享内存 / Windows API";
+}
+
+uint PanelChannelHash(const string value)
+{
+   uint hash = 2166136261;
+   int length = StringLen(value);
+   for(int i = 0; i < length; i++)
+   {
+      hash ^= (uint)StringGetCharacter(value, i);
+      hash = (uint)(hash * 16777619);
+   }
+   return hash;
+}
+
+string PanelPauseGlobalName()
+{
+   return "LFCP_" +
+          IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
+          IntegerToString((long)InpCopyMagic) + "_" +
+          IntegerToString((long)PanelChannelHash(InpChannelName)) + "_PAUSE";
+}
+
+string PanelObjectName(const string suffix)
+{
+   return g_panel_object_prefix + suffix;
+}
+
+void PanelSetPaused(const bool paused)
+{
+   g_panel_entries_paused = paused;
+   GlobalVariableSet(PanelPauseGlobalName(), paused ? 1.0 : 0.0);
+}
+
+bool PanelEntriesPaused()
+{
+   return InpShowPanel && g_panel_entries_paused;
+}
+
+void PanelCreateBackground(const string suffix,
+                           const int x,
+                           const int y,
+                           const int width,
+                           const int height,
+                           const color background,
+                           const color border)
+{
+   string name = PanelObjectName(suffix);
+   ObjectDelete(0, name);
+   if(!ObjectCreate(0, name, OBJ_RECTANGLE_LABEL, 0, 0, 0))
+      return;
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER, InpPanelCorner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, background);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, border);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+   ObjectSetInteger(0, name, OBJPROP_BACK, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 0);
+}
+
+void PanelCreateLabel(const string suffix,
+                      const int x,
+                      const int y,
+                      const string text,
+                      const color text_color,
+                      const int font_size = 9)
+{
+   string name = PanelObjectName(suffix);
+   ObjectDelete(0, name);
+   if(!ObjectCreate(0, name, OBJ_LABEL, 0, 0, 0))
+      return;
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER, InpPanelCorner);
+   ObjectSetInteger(0, name, OBJPROP_ANCHOR, ANCHOR_LEFT_UPPER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, text_color);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, font_size);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 1);
+   ObjectSetString(0, name, OBJPROP_FONT, "Microsoft YaHei");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void PanelCreateButton(const string suffix,
+                       const int x,
+                       const int y,
+                       const int width,
+                       const int height,
+                       const string text,
+                       const color background)
+{
+   string name = PanelObjectName(suffix);
+   ObjectDelete(0, name);
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0))
+      return;
+
+   ObjectSetInteger(0, name, OBJPROP_CORNER, InpPanelCorner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, width);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, height);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, background);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrSlateGray);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+   ObjectSetInteger(0, name, OBJPROP_STATE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, name, OBJPROP_SELECTED, false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN, true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER, 2);
+   ObjectSetString(0, name, OBJPROP_FONT, "Microsoft YaHei");
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+}
+
+void PanelSetLabel(const string suffix, const string text, const color text_color)
+{
+   string name = PanelObjectName(suffix);
+   if(ObjectFind(0, name) < 0)
+      return;
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR, text_color);
+}
+
+void PanelSetButton(const string suffix, const string text, const color background)
+{
+   string name = PanelObjectName(suffix);
+   if(ObjectFind(0, name) < 0)
+      return;
+   ObjectSetString(0, name, OBJPROP_TEXT, text);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR, background);
+   ObjectSetInteger(0, name, OBJPROP_STATE, false);
+}
+
+void PanelInitialize()
+{
+   if(!InpShowPanel || !PanelRoleIsReceiver())
+      return;
+
+   g_panel_object_prefix = "LFCPANEL_" + IntegerToString((long)ChartID()) + "_";
+   string pause_name = PanelPauseGlobalName();
+   g_panel_entries_paused = GlobalVariableCheck(pause_name) &&
+                            GlobalVariableGet(pause_name) > 0.5;
+
+   int x = InpPanelX;
+   int y = InpPanelY;
+   PanelCreateBackground("BG", x, y, 390, 305, C'24,29,38', C'62,77,98');
+   PanelCreateBackground("HEADER_BG", x + 1, y + 1, 388, 34, C'35,94,150', C'35,94,150');
+   PanelCreateLabel("TITLE", x + 14, y + 8, "LOSS FOLLOW  跟单控制面板", clrWhite, 11);
+   PanelCreateLabel("TRANSPORT", x + 14, y + 43, "传输：--", clrSilver);
+   PanelCreateLabel("ACCOUNT", x + 14, y + 64, "账户：--", clrSilver);
+   PanelCreateLabel("STATUS", x + 14, y + 85, "状态：--", clrOrange);
+   PanelCreateLabel("SOURCE", x + 14, y + 106, "源单：--", clrSilver);
+   PanelCreateLabel("COPY", x + 14, y + 127, "跟单：--", clrSilver);
+   PanelCreateLabel("VOLUME", x + 14, y + 148, "手数：--", clrSilver);
+   PanelCreateLabel("PROFIT", x + 14, y + 169, "浮盈亏：--", clrSilver);
+   PanelCreateLabel("TRADE", x + 14, y + 190, "自动交易：--", clrSilver);
+   PanelCreateLabel("PAUSE", x + 14, y + 211, "新开控制：--", clrSilver);
+   PanelCreateButton("BTN_PAUSE", x + 12, y + 238, 112, 30, "暂停新开", C'184,117,22');
+   PanelCreateButton("BTN_CLOSE", x + 139, y + 238, 112, 30, "全部平仓", C'161,52,58');
+   PanelCreateButton("BTN_DELETE", x + 266, y + 238, 112, 30, "删除挂单", C'115,68,143');
+   PanelCreateLabel("ACTION", x + 14, y + 278, "操作：就绪", clrDarkGray, 8);
+   PanelUpdate(true);
+}
+
+void PanelDestroy()
+{
+   if(g_panel_object_prefix == "")
+      return;
+
+   int total = ObjectsTotal(0, -1, -1);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = ObjectName(0, i, -1, -1);
+      if(StringFind(name, g_panel_object_prefix) == 0)
+         ObjectDelete(0, name);
+   }
+   ChartRedraw(0);
+   g_panel_object_prefix = "";
+}
+
+void PanelCollectCopyStats(int &position_count,
+                           int &pending_count,
+                           double &total_volume,
+                           double &floating_profit)
+{
+   position_count = 0;
+   pending_count = 0;
+   total_volume = 0.0;
+   floating_profit = 0.0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         continue;
+      if(!IsCopyPosition())
+         continue;
+
+      position_count++;
+      total_volume += PositionGetDouble(POSITION_VOLUME);
+      floating_profit += PositionGetDouble(POSITION_PROFIT) +
+                         PositionGetDouble(POSITION_SWAP);
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+         continue;
+      if(!IsCopyComment(OrderGetString(ORDER_COMMENT)))
+         continue;
+      pending_count++;
+   }
+}
+
+void PanelUpdate(const bool force)
+{
+   if(!InpShowPanel || !PanelRoleIsReceiver() || g_panel_object_prefix == "")
+      return;
+
+   ulong now_tick = GetTickCount64();
+   ulong refresh_ms = (ulong)(InpPanelRefreshMs < 100 ? 100 : InpPanelRefreshMs);
+   if(!force &&
+      g_panel_last_update_tick_ms > 0 &&
+      now_tick >= g_panel_last_update_tick_ms &&
+      now_tick - g_panel_last_update_tick_ms < refresh_ms)
+      return;
+   g_panel_last_update_tick_ms = now_tick;
+
+   if(g_panel_confirm_action != "" && now_tick > g_panel_confirm_until_tick_ms)
+      g_panel_confirm_action = "";
+
+   int copy_count = 0;
+   int pending_count = 0;
+   double total_volume = 0.0;
+   double floating_profit = 0.0;
+   PanelCollectCopyStats(copy_count, pending_count, total_volume, floating_profit);
+
+   string connection_text = "等待源端快照";
+   color connection_color = clrOrange;
+   if(g_snapshot_fresh)
+   {
+      connection_text = "快照正常";
+      connection_color = clrLimeGreen;
+   }
+   else if(g_have_snapshot)
+   {
+      connection_text = "快照暂停或已过期";
+      connection_color = clrTomato;
+   }
+
+   string latency_text = "--";
+   if(g_snapshot_publish_tick_ms > 0 && now_tick >= g_snapshot_publish_tick_ms)
+      latency_text = IntegerToString((long)(now_tick - g_snapshot_publish_tick_ms)) + " ms";
+
+   PanelSetLabel("TRANSPORT", "传输：" + PanelTransportName() + "  通道：" + InpChannelName, clrSilver);
+   PanelSetLabel("ACCOUNT",
+                 "账户：" + IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) +
+                 "  服务器：" + AccountInfoString(ACCOUNT_SERVER),
+                 clrSilver);
+   PanelSetLabel("STATUS",
+                 "状态：" + connection_text + "  延迟/年龄：" + latency_text,
+                 connection_color);
+   PanelSetLabel("SOURCE",
+                 "源单：" + IntegerToString(ArraySize(g_sources)) +
+                 "  快照序号：" + IntegerToString((long)g_snapshot_sequence),
+                 clrSilver);
+   PanelSetLabel("COPY",
+                 "跟单持仓：" + IntegerToString(copy_count) +
+                 "  跟单挂单：" + IntegerToString(pending_count),
+                 clrSilver);
+   PanelSetLabel("VOLUME", "跟单总手数：" + DoubleToString(total_volume, 2), clrSilver);
+   PanelSetLabel("PROFIT",
+                 "跟单浮盈亏：" + DoubleToString(floating_profit, 2) + " " +
+                 AccountInfoString(ACCOUNT_CURRENCY),
+                 floating_profit >= 0.0 ? clrLimeGreen : clrTomato);
+   PanelSetLabel("TRADE",
+                 "自动交易：" + (IsAlgoTradingAllowed() ? "已开启" : "已关闭"),
+                 IsAlgoTradingAllowed() ? clrLimeGreen : clrTomato);
+   PanelSetLabel("PAUSE",
+                 "新开控制：" + (PanelEntriesPaused() ? "已暂停（平仓逻辑继续）" : "正常跟单"),
+                 PanelEntriesPaused() ? clrOrange : clrLimeGreen);
+   PanelSetLabel("ACTION", "操作：" + g_panel_last_action, clrDarkGray);
+
+   if(g_panel_confirm_action == "CLOSE")
+      PanelSetButton("BTN_CLOSE", "再次点击确认", C'205,63,69');
+   else
+      PanelSetButton("BTN_CLOSE", "全部平仓", C'161,52,58');
+
+   if(g_panel_confirm_action == "DELETE")
+      PanelSetButton("BTN_DELETE", "再次点击确认", C'142,76,177');
+   else
+      PanelSetButton("BTN_DELETE", "删除挂单", C'115,68,143');
+
+   PanelSetButton("BTN_PAUSE",
+                  PanelEntriesPaused() ? "恢复新开" : "暂停新开",
+                  PanelEntriesPaused() ? C'42,134,88' : C'184,117,22');
+   ChartRedraw(0);
+}
+
+bool PanelConfirmAction(const string action)
+{
+   ulong now_tick = GetTickCount64();
+   if(g_panel_confirm_action == action && now_tick <= g_panel_confirm_until_tick_ms)
+   {
+      g_panel_confirm_action = "";
+      g_panel_confirm_until_tick_ms = 0;
+      return true;
+   }
+
+   g_panel_confirm_action = action;
+   g_panel_confirm_until_tick_ms = now_tick + 3000;
+   g_panel_last_action = action == "CLOSE"
+                         ? "3秒内再次点击“全部平仓”确认"
+                         : "3秒内再次点击“删除挂单”确认";
+   return false;
+}
+
+void PanelCloseAllCopies()
+{
+   PanelSetPaused(true);
+   int success = 0;
+   int failed = 0;
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+      if(!IsCopyPosition())
+         continue;
+
+      ulong source_ticket = SourceTicketFromCurrentPosition();
+      if(source_ticket == 0)
+         continue;
+      if(CloseCopyPosition(copy_ticket, source_ticket))
+         success++;
+      else
+         failed++;
+   }
+
+   g_panel_last_action = "全部平仓完成：成功 " + IntegerToString(success) +
+                         "，失败 " + IntegerToString(failed) + "；已暂停新开";
+}
+
+void PanelDeleteAllPendings()
+{
+   PanelSetPaused(true);
+   int success = 0;
+   int failed = 0;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket == 0 || !OrderSelect(order_ticket))
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+         continue;
+
+      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      if(source_ticket == 0)
+         continue;
+      if(DeleteCopyPending(order_ticket, source_ticket))
+         success++;
+      else
+         failed++;
+   }
+
+   g_panel_last_action = "删除挂单完成：成功 " + IntegerToString(success) +
+                         "，失败 " + IntegerToString(failed) + "；已暂停新开";
+}
+
+void PanelHandleChartEvent(const int event_id, const string object_name)
+{
+   if(!InpShowPanel || !PanelRoleIsReceiver() || event_id != CHARTEVENT_OBJECT_CLICK)
+      return;
+
+   if(object_name == PanelObjectName("BTN_PAUSE"))
+   {
+      PanelSetPaused(!PanelEntriesPaused());
+      g_panel_confirm_action = "";
+      g_panel_last_action = PanelEntriesPaused()
+                            ? "已暂停新开；同步平仓和盈利平仓继续运行"
+                            : "已恢复新开跟单";
+   }
+   else if(object_name == PanelObjectName("BTN_CLOSE"))
+   {
+      if(PanelConfirmAction("CLOSE"))
+         PanelCloseAllCopies();
+   }
+   else if(object_name == PanelObjectName("BTN_DELETE"))
+   {
+      if(PanelConfirmAction("DELETE"))
+         PanelDeleteAllPendings();
+   }
+   else
+      return;
+
+   PanelUpdate(true);
+}
+
 void CheckPositions()
 {
    bool fresh = LoadMemorySnapshot(false);
+   PanelUpdate(false);
 
    if(InpCloseCopyWithSource && fresh)
    {
@@ -1134,6 +1582,9 @@ void CheckPositions()
    ApplyFirstEntryTimeFilter();
 
    if(!fresh)
+      return;
+
+   if(PanelEntriesPaused())
       return;
 
    CheckGridActivationEntries();

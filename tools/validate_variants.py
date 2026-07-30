@@ -15,7 +15,14 @@ FILES = {
     "file_snapshot": ROOT / "FileLossFollow.mq5",
 }
 
-EVENTS = ("OnInit", "OnDeinit", "OnTick", "OnTimer", "OnTradeTransaction")
+EVENTS = (
+    "OnInit",
+    "OnDeinit",
+    "OnTick",
+    "OnTimer",
+    "OnChartEvent",
+    "OnTradeTransaction",
+)
 CORE_FUNCTIONS = (
     "CheckPositions",
     "CheckGridActivationEntries",
@@ -31,6 +38,11 @@ CORE_FUNCTIONS = (
     "ResetInactiveGridGroups",
     "CalculateCopyVolume",
     "MatchSourceProfile",
+    "PanelInitialize",
+    "PanelUpdate",
+    "PanelCloseAllCopies",
+    "PanelDeleteAllPendings",
+    "PanelHandleChartEvent",
 )
 
 
@@ -237,6 +249,25 @@ def main() -> int:
         }
         if len(set(bodies.values())) != 1:
             fail(f"business logic drift in {function_name}")
+
+    if (ROOT / "LossFollowPanel.mq5").exists():
+        fail("panel must stay embedded; standalone LossFollowPanel.mq5 found")
+    for name, source in sources.items():
+        for token in ("InpShowPanel", "OBJ_RECTANGLE_LABEL", "OBJ_BUTTON", "PanelEntriesPaused"):
+            if token not in source:
+                fail(f"{name}: embedded panel token missing: {token}")
+        check_positions = extract_function(source, "CheckPositions")
+        close_index = check_positions.find("CheckMinuteProfitClose()")
+        pause_index = check_positions.find("if(PanelEntriesPaused())")
+        entry_index = check_positions.find("CheckGridActivationEntries()")
+        if not (0 <= close_index < pause_index < entry_index):
+            fail(f"{name}: pause gate must keep close logic active and precede new entries")
+        if "PanelSetPaused(true);" not in extract_function(source, "PanelCloseAllCopies"):
+            fail(f"{name}: panel close-all must pause new entries first")
+        if "PanelSetPaused(true);" not in extract_function(source, "PanelDeleteAllPendings"):
+            fail(f"{name}: panel delete-all must pause new entries first")
+        if "PanelDestroy();" not in extract_function(source, "OnDeinit"):
+            fail(f"{name}: panel objects are not removed on deinitialization")
 
     print("EA variant validation OK")
     for name in FILES:
