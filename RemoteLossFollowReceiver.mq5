@@ -4,7 +4,7 @@
 //|  when the remote source reaches a floating loss threshold.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.10"
 #property description "远程浮亏跟单接收端：读取发送端快照后按浮亏距离跟单。"
 
 enum ENUM_COPY_LOT_MODE
@@ -191,8 +191,10 @@ input string             InpSymbolMap            = "";           // 品种映射
 input bool               InpCloseCopyWithSource  = true;         // 源单平仓后跟单一起市价平仓
 input int                InpCloseRetrySeconds    = 3;            // 同一跟单平仓失败后的重试间隔秒数
 input bool               InpOneCopyPerPosition   = true;         // 每个源单只跟一次
-input int                InpScanIntervalMs       = 500;          // 轮询扫描间隔，单位毫秒
-input bool               InpPrintDebug           = true;         // 打印调试日志
+input int                InpScanIntervalMs       = 50;           // 本机双MT5建议50毫秒；最低20毫秒
+input bool               InpBeijingFirstEntryTimeFilterEnabled = false; // 启用跟单首单北京时间过滤
+input string             InpBeijingFirstEntryTimeFilterRanges  = "04:00-10:00,18:00-23:30"; // 跟单空仓时禁止开首单的北京时间区间
+input bool               InpPrintDebug           = false;        // 打印调试日志；追求速度时关闭
 
 string g_prefix;
 string g_snapshot_file;
@@ -200,6 +202,12 @@ RemoteSourcePosition g_sources[];
 datetime g_snapshot_time = 0;
 bool g_have_snapshot = false;
 bool g_snapshot_fresh = false;
+ulong g_snapshot_sequence = 0;
+ulong g_snapshot_publish_tick_ms = 0;
+ulong g_last_snapshot_read_tick_ms = 0;
+datetime g_last_snapshot_error_log = 0;
+datetime g_last_snapshot_latency_log = 0;
+datetime g_last_first_entry_time_filter_log = 0;
 
 void LoadProfile(const int index, SourceProfile& profile)
 {
@@ -470,6 +478,9 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
+   if(!ValidateBeijingFirstEntryTimeFilter())
+      return INIT_PARAMETERS_INCORRECT;
+
    g_snapshot_file = SnapshotFileName();
    g_prefix = "RLFC_" +
               IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
@@ -479,9 +490,9 @@ int OnInit()
    if(margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
       Print("Warning: this EA is designed for hedging accounts. On netting accounts, source and copy positions may merge.");
 
-   int timer_period = InpScanIntervalMs < 100 ? 100 : InpScanIntervalMs;
+   int timer_period = InpScanIntervalMs < 20 ? 20 : InpScanIntervalMs;
    EventSetMillisecondTimer((uint)timer_period);
-   LoadRemoteSnapshot();
+   LoadRemoteSnapshot(true);
    return INIT_SUCCEEDED;
 }
 
@@ -504,7 +515,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeRequest& request,
                         const MqlTradeResult& result)
 {
-   if(InpCloseCopyWithSource && LoadRemoteSnapshot())
+   if(InpCloseCopyWithSource && LoadRemoteSnapshot(true))
    {
       CloseCopiesWithoutSource();
       DeletePendingsWithoutSource();
@@ -514,7 +525,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 
 void CheckPositions()
 {
-   bool fresh = LoadRemoteSnapshot();
+   bool fresh = LoadRemoteSnapshot(false);
 
    if(InpCloseCopyWithSource && fresh)
    {
@@ -527,6 +538,7 @@ void CheckPositions()
 
    CheckMinuteProfitClose();
    CheckBasketProfitClose();
+   ApplyFirstEntryTimeFilter();
 
    if(!fresh)
       return;
@@ -631,6 +643,12 @@ void ProcessGridGroup(const SourceProfile& profile,
    {
       if(!triggered)
          return;
+
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(0, local_symbol, 1, "grid activation");
+         return;
+      }
 
       SetGridGroupActive(profile.profile_index, symbol, position_type);
       if(InpPrintDebug)
@@ -751,6 +769,12 @@ void CopyGridSources(const SourceProfile& profile,
 
       double source_sl = source.sl;
       double source_tp = source.tp;
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(source_ticket, local_symbol, 1, "grid copy");
+         return;
+      }
+
       if(OpenCopyTrade(source_ticket, local_symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
       {
          MarkCopied(source_ticket, 1);
@@ -848,12 +872,24 @@ void ProcessSourceLevel(const RemoteSourcePosition& source, const SourceProfile&
 
    if(profile.entry_mode == ENTRY_PENDING_AT_TRIGGER)
    {
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(source_ticket, symbol, level_index, "pending");
+         return;
+      }
+
       PlaceCopyPending(source_ticket, symbol, position_type, source_open_price, volume, source_sl, source_tp, profile, level_index);
       return;
    }
 
    if(!IsLossTriggered(loss_points, loss_price, profile, level_index))
       return;
+
+   if(IsFirstCopyEntryTimeBlocked())
+   {
+      LogFirstEntryTimeFilterSkip(source_ticket, symbol, level_index, "market");
+      return;
+   }
 
    if(OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, loss_points, loss_price, profile, level_index))
       MarkCopied(source_ticket, level_index);
@@ -965,6 +1001,239 @@ bool IsLossTriggered(const double loss_points, const double loss_price, const So
       return loss_price >= LevelLossPrice(profile, level_index);
 
    return loss_points >= LevelLossPoints(profile, level_index);
+}
+
+bool ValidateBeijingFirstEntryTimeFilter()
+{
+   if(!InpBeijingFirstEntryTimeFilterEnabled)
+      return true;
+
+   if(!ValidateTimeRanges(InpBeijingFirstEntryTimeFilterRanges))
+   {
+      Print("InpBeijingFirstEntryTimeFilterRanges format must be like 04:00-10:00,18:00-23:30.");
+      return false;
+   }
+
+   return true;
+}
+
+string NormalizeTimeRanges(string ranges)
+{
+   StringReplace(ranges, " ", "");
+   StringReplace(ranges, "\t", "");
+   StringReplace(ranges, "，", ";");
+   StringReplace(ranges, "；", ";");
+   StringReplace(ranges, ",", ";");
+   return ranges;
+}
+
+bool IsDigitString(const string text)
+{
+   int length = StringLen(text);
+   if(length <= 0)
+      return false;
+
+   for(int i = 0; i < length; i++)
+   {
+      ushort ch = StringGetCharacter(text, i);
+      if(ch < 48 || ch > 57)
+         return false;
+   }
+
+   return true;
+}
+
+bool ParseClockMinute(const string text, int& minute_of_day)
+{
+   int colon_pos = StringFind(text, ":");
+   if(colon_pos <= 0 || colon_pos >= StringLen(text) - 1)
+      return false;
+
+   string hour_text = StringSubstr(text, 0, colon_pos);
+   string minute_text = StringSubstr(text, colon_pos + 1);
+   if(!IsDigitString(hour_text) || !IsDigitString(minute_text))
+      return false;
+
+   int hour = (int)StringToInteger(hour_text);
+   int minute = (int)StringToInteger(minute_text);
+   if(hour < 0 || hour > 24 || minute < 0 || minute > 59)
+      return false;
+
+   if(hour == 24 && minute != 0)
+      return false;
+
+   minute_of_day = hour * 60 + minute;
+   return true;
+}
+
+bool ParseTimeRange(const string range_text, int& start_minute, int& end_minute)
+{
+   int dash_pos = StringFind(range_text, "-");
+   if(dash_pos <= 0 || dash_pos >= StringLen(range_text) - 1)
+      return false;
+
+   if(StringFind(range_text, "-", dash_pos + 1) >= 0)
+      return false;
+
+   string start_text = StringSubstr(range_text, 0, dash_pos);
+   string end_text = StringSubstr(range_text, dash_pos + 1);
+   return ParseClockMinute(start_text, start_minute) &&
+          ParseClockMinute(end_text, end_minute);
+}
+
+bool ValidateTimeRanges(string ranges)
+{
+   ranges = NormalizeTimeRanges(ranges);
+   if(ranges == "")
+      return false;
+
+   string parts[];
+   int count = StringSplit(ranges, ';', parts);
+   if(count <= 0)
+      return false;
+
+   bool has_range = false;
+   for(int i = 0; i < count; i++)
+   {
+      if(parts[i] == "")
+         continue;
+
+      int start_minute = 0;
+      int end_minute = 0;
+      if(!ParseTimeRange(parts[i], start_minute, end_minute))
+         return false;
+
+      has_range = true;
+   }
+
+   return has_range;
+}
+
+bool IsMinuteInRange(const int minute_of_day, const int start_minute, const int end_minute)
+{
+   if(start_minute == end_minute)
+      return true;
+
+   if(start_minute < end_minute)
+      return minute_of_day >= start_minute && minute_of_day < end_minute;
+
+   return minute_of_day >= start_minute || minute_of_day < end_minute;
+}
+
+bool IsMinuteInTimeRanges(const int minute_of_day, string ranges)
+{
+   ranges = NormalizeTimeRanges(ranges);
+   if(ranges == "")
+      return false;
+
+   string parts[];
+   int count = StringSplit(ranges, ';', parts);
+   for(int i = 0; i < count; i++)
+   {
+      if(parts[i] == "")
+         continue;
+
+      int start_minute = 0;
+      int end_minute = 0;
+      if(!ParseTimeRange(parts[i], start_minute, end_minute))
+         continue;
+
+      if(IsMinuteInRange(minute_of_day, start_minute, end_minute))
+         return true;
+   }
+
+   return false;
+}
+
+int BeijingMinuteOfDay()
+{
+   datetime beijing_time = TimeGMT() + 8 * 60 * 60;
+   MqlDateTime now;
+   TimeToStruct(beijing_time, now);
+   return now.hour * 60 + now.min;
+}
+
+bool IsBeijingFirstEntryFilterTime()
+{
+   return IsMinuteInTimeRanges(BeijingMinuteOfDay(), InpBeijingFirstEntryTimeFilterRanges);
+}
+
+bool HasOpenCopyPositions()
+{
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+
+      if(IsCopyPosition())
+         return true;
+   }
+
+   return false;
+}
+
+bool IsFirstCopyEntryTimeBlocked()
+{
+   if(!InpBeijingFirstEntryTimeFilterEnabled)
+      return false;
+
+   if(HasOpenCopyPositions())
+      return false;
+
+   return IsBeijingFirstEntryFilterTime();
+}
+
+string BeijingTimeFilterNowText()
+{
+   datetime beijing_time = TimeGMT() + 8 * 60 * 60;
+   MqlDateTime now;
+   TimeToStruct(beijing_time, now);
+   return StringFormat("%02d:%02d", now.hour, now.min);
+}
+
+void LogFirstEntryTimeFilterSkip(const ulong source_ticket,
+                                 const string symbol,
+                                 const int level_index,
+                                 const string action)
+{
+   if(!InpPrintDebug)
+      return;
+
+   datetime now = TimeGMT();
+   if(g_last_first_entry_time_filter_log > 0 &&
+      now - g_last_first_entry_time_filter_log < 60)
+      return;
+
+   g_last_first_entry_time_filter_log = now;
+   PrintFormat("First remote copy entry blocked by Beijing time filter. action=%s source=%I64u level=L%d symbol=%s beijing=%s ranges=%s",
+               action,
+               source_ticket,
+               level_index,
+               symbol,
+               BeijingTimeFilterNowText(),
+               InpBeijingFirstEntryTimeFilterRanges);
+}
+
+void ApplyFirstEntryTimeFilter()
+{
+   if(!IsFirstCopyEntryTimeBlocked())
+      return;
+
+   int total = OrdersTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket == 0 || !OrderSelect(order_ticket))
+         continue;
+
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+         continue;
+
+      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      DeleteCopyPending(order_ticket, source_ticket);
+   }
 }
 
 void CheckMinuteProfitClose()
@@ -1818,7 +2087,7 @@ bool DeleteCopyPending(const ulong order_ticket, const ulong source_ticket)
    }
 
    if(InpPrintDebug)
-      PrintFormat("Pending copy deleted with source. order=%I64u source=%I64u", order_ticket, source_ticket);
+      PrintFormat("Pending copy deleted. order=%I64u source=%I64u", order_ticket, source_ticket);
 
    return true;
 }
@@ -1991,21 +2260,41 @@ void MarkCopied(const ulong source_ticket, const int level_index)
    GlobalVariableSet(CopyGlobalName(source_ticket, level_index), (double)TimeCurrent());
 }
 
-bool LoadRemoteSnapshot()
+bool LoadRemoteSnapshot(const bool force)
 {
+   ulong now_tick_ms = GetTickCount64();
+   ulong read_interval_ms = (ulong)(InpScanIntervalMs < 20 ? 20 : InpScanIntervalMs);
+   if(!force &&
+      g_last_snapshot_read_tick_ms > 0 &&
+      now_tick_ms >= g_last_snapshot_read_tick_ms &&
+      now_tick_ms - g_last_snapshot_read_tick_ms < read_interval_ms)
+   {
+      UpdateSnapshotFreshness();
+      return g_snapshot_fresh;
+   }
+   g_last_snapshot_read_tick_ms = now_tick_ms;
+
    RemoteSourcePosition loaded[];
    datetime snapshot_time = 0;
+   datetime end_time = 0;
+   ulong loaded_sequence = 0;
+   ulong end_sequence = 0;
+   ulong publish_tick_ms = 0;
+   int expected_count = -1;
+   bool protocol_v2 = false;
+   bool have_meta = false;
    bool complete = false;
+   bool paused = false;
 
+   ResetLastError();
    int handle = FileOpen(g_snapshot_file,
-                         FILE_READ | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         FILE_READ | FILE_CSV | FILE_COMMON | FILE_UNICODE | FILE_SHARE_READ,
                          '\t');
    if(handle == INVALID_HANDLE)
    {
-      g_snapshot_fresh = false;
-      if(InpPrintDebug)
-         PrintFormat("Remote snapshot not readable. file=%s error=%d", g_snapshot_file, GetLastError());
-      return false;
+      PrintSnapshotReadError("Remote snapshot not readable", GetLastError());
+      UpdateSnapshotFreshness();
+      return g_snapshot_fresh;
    }
 
    while(!FileIsEnding(handle))
@@ -2022,12 +2311,29 @@ bool LoadRemoteSnapshot()
          string server = FileReadString(handle);
          string time_text = FileReadString(handle);
          snapshot_time = (datetime)StringToInteger(time_text);
-         if(version != "RLFC1" || channel != InpChannelName)
+
+         if(version == "RLFC2")
+         {
+            protocol_v2 = true;
+            loaded_sequence = (ulong)StringToInteger(FileReadString(handle));
+            publish_tick_ms = (ulong)StringToInteger(FileReadString(handle));
+         }
+         else if(version != "RLFC1")
          {
             FileClose(handle);
-            g_snapshot_fresh = false;
-            return false;
+            PrintSnapshotReadError("Unsupported snapshot protocol", 0);
+            UpdateSnapshotFreshness();
+            return g_snapshot_fresh;
          }
+
+         if(channel != InpChannelName)
+         {
+            FileClose(handle);
+            PrintSnapshotReadError("Snapshot channel mismatch", 0);
+            UpdateSnapshotFreshness();
+            return g_snapshot_fresh;
+         }
+         have_meta = true;
          continue;
       }
 
@@ -2058,12 +2364,19 @@ bool LoadRemoteSnapshot()
          continue;
       }
 
+      if(tag == "PAUSED")
+      {
+         string pause_reason = FileReadString(handle);
+         paused = true;
+         continue;
+      }
+
       if(tag == "END")
       {
-         string count_text = FileReadString(handle);
-         string end_time_text = FileReadString(handle);
-         if(snapshot_time == 0)
-            snapshot_time = (datetime)StringToInteger(end_time_text);
+         expected_count = (int)StringToInteger(FileReadString(handle));
+         end_time = (datetime)StringToInteger(FileReadString(handle));
+         if(protocol_v2)
+            end_sequence = (ulong)StringToInteger(FileReadString(handle));
          complete = true;
          break;
       }
@@ -2071,30 +2384,114 @@ bool LoadRemoteSnapshot()
 
    FileClose(handle);
 
-   if(!complete || snapshot_time <= 0)
+   bool valid = have_meta &&
+                complete &&
+                expected_count >= 0 &&
+                expected_count == ArraySize(loaded);
+   if(protocol_v2)
    {
+      valid = valid &&
+              loaded_sequence > 0 &&
+              loaded_sequence == end_sequence &&
+              snapshot_time == end_time;
+   }
+   else if(snapshot_time == 0)
+   {
+      snapshot_time = end_time;
+   }
+
+   if(!valid)
+   {
+      PrintSnapshotReadError("Incomplete or inconsistent snapshot ignored", 0);
+      UpdateSnapshotFreshness();
+      return g_snapshot_fresh;
+   }
+
+   if(paused)
+   {
+      ArrayResize(g_sources, 0);
+      g_snapshot_time = 0;
+      g_snapshot_sequence = loaded_sequence;
+      g_snapshot_publish_tick_ms = publish_tick_ms;
+      g_have_snapshot = true;
       g_snapshot_fresh = false;
       return false;
    }
 
-   ArrayResize(g_sources, ArraySize(loaded));
-   for(int i = 0; i < ArraySize(loaded); i++)
-      g_sources[i] = loaded[i];
+   if(snapshot_time <= 0)
+   {
+      PrintSnapshotReadError("Snapshot time is invalid", 0);
+      UpdateSnapshotFreshness();
+      return g_snapshot_fresh;
+   }
+
+   bool changed = !protocol_v2 || loaded_sequence != g_snapshot_sequence;
+   if(changed)
+   {
+      ArrayResize(g_sources, ArraySize(loaded));
+      for(int i = 0; i < ArraySize(loaded); i++)
+         g_sources[i] = loaded[i];
+   }
 
    g_snapshot_time = snapshot_time;
+   g_snapshot_sequence = loaded_sequence;
+   g_snapshot_publish_tick_ms = publish_tick_ms;
    g_have_snapshot = true;
-   int snapshot_age = (int)(TimeLocal() - g_snapshot_time);
-   g_snapshot_fresh = snapshot_age >= 0 && snapshot_age <= InpSourceStaleSeconds;
+   UpdateSnapshotFreshness();
 
-   if(InpPrintDebug && !g_snapshot_fresh)
+   if(InpPrintDebug && changed && protocol_v2)
    {
-      PrintFormat("Remote snapshot is stale. file=%s age=%d seconds limit=%d",
-                  g_snapshot_file,
-                  snapshot_age,
-                  InpSourceStaleSeconds);
+      datetime now = TimeLocal();
+      if(now != g_last_snapshot_latency_log)
+      {
+         g_last_snapshot_latency_log = now;
+         ulong latency_ms = 0;
+         ulong receive_tick_ms = GetTickCount64();
+         if(receive_tick_ms >= publish_tick_ms)
+            latency_ms = receive_tick_ms - publish_tick_ms;
+         PrintFormat("Remote snapshot received. seq=%I64u positions=%d latency=%I64u ms",
+                     loaded_sequence,
+                     ArraySize(g_sources),
+                     latency_ms);
+      }
    }
 
    return g_snapshot_fresh;
+}
+
+void UpdateSnapshotFreshness()
+{
+   if(!g_have_snapshot || g_snapshot_time <= 0)
+   {
+      g_snapshot_fresh = false;
+      return;
+   }
+
+   if(g_snapshot_publish_tick_ms > 0)
+   {
+      ulong now_tick_ms = GetTickCount64();
+      ulong stale_limit_ms = (ulong)InpSourceStaleSeconds * 1000;
+      g_snapshot_fresh = now_tick_ms >= g_snapshot_publish_tick_ms &&
+                         now_tick_ms - g_snapshot_publish_tick_ms <= stale_limit_ms;
+   }
+   else
+   {
+      int snapshot_age = (int)(TimeLocal() - g_snapshot_time);
+      g_snapshot_fresh = snapshot_age >= 0 && snapshot_age <= InpSourceStaleSeconds;
+   }
+}
+
+void PrintSnapshotReadError(const string message, const int error_code)
+{
+   if(!InpPrintDebug)
+      return;
+
+   datetime now = TimeLocal();
+   if(now == g_last_snapshot_error_log)
+      return;
+
+   g_last_snapshot_error_log = now;
+   PrintFormat("%s. file=%s error=%d", message, g_snapshot_file, error_code);
 }
 
 bool RemoteSourceById(const ulong source_id, RemoteSourcePosition& source)
