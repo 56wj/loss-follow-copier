@@ -35,8 +35,14 @@ EVENTS = (
 CORE_FUNCTIONS = (
     "CheckPositions",
     "CheckGridActivationEntries",
+    "CheckTotalLossActivationEntries",
     "ProcessGridGroup",
+    "ProcessTotalLossGroup",
+    "SourceTotalLossStats",
+    "SourcePositionProfitMoney",
+    "CopyTotalLossSources",
     "ProcessSourceLevel",
+    "IsCopyDirectionAllowed",
     "OpenCopyTrade",
     "CloseCopiesWithoutSource",
     "DeletePendingsWithoutSource",
@@ -52,6 +58,24 @@ CORE_FUNCTIONS = (
     "PanelCloseAllCopies",
     "PanelDeleteAllPendings",
     "PanelHandleChartEvent",
+    "RoundKeyIndex",
+    "AddRoundCopyCount",
+    "ParseBasketKey",
+    "TotalLossBasketKey",
+    "RoundTrackingKey",
+    "ParseRoundTrackingKey",
+    "SourceRoundExists",
+    "SourceTotalLossRoundExists",
+    "StopActiveCopyRounds",
+    "UpdateRoundCopyTracking",
+    "TotalLossStatePrefix",
+    "TotalLossGroupStateName",
+    "IsTotalLossGroupActive",
+    "IsTotalLossGroupStopped",
+    "SetTotalLossGroupActive",
+    "SetTotalLossGroupStopped",
+    "ParseTotalLossStateName",
+    "ResetInactiveTotalLossGroups",
 )
 PROTOCOL_SHARED_FUNCTIONS = (
     "WinApiMemoryCrc32",
@@ -322,6 +346,12 @@ def main() -> int:
     for token in ("RlfcMemoryBridge", "kernel32.dll", "CreateFileMappingW"):
         if token in file_snapshot:
             fail(f"file_snapshot: unexpected memory transport token {token}")
+    file_trade_event = extract_function(file_snapshot, "OnTradeTransaction")
+    if "InpFileRole == FILE_FOLLOW_SENDER" not in file_trade_event:
+        fail("file_snapshot: OnTradeTransaction must use the file-role selector")
+    for token in ("InpMemoryRole", "MEMORY_FOLLOW_SENDER", "LoadMemorySnapshot"):
+        if token in file_trade_event:
+            fail(f"file_snapshot: OnTradeTransaction contains memory-role token {token}")
 
     magics = {name: copy_magic(source) for name, source in sources.items()}
     if len(set(magics.values())) != len(magics):
@@ -347,10 +377,78 @@ def main() -> int:
         entry_index = check_positions.find("CheckGridActivationEntries()")
         if not (0 <= close_index < pause_index < entry_index):
             fail(f"{name}: pause gate must keep close logic active and precede new entries")
-        if "PanelSetPaused(true);" not in extract_function(source, "PanelCloseAllCopies"):
-            fail(f"{name}: panel close-all must pause new entries first")
+        panel_close_all = extract_function(source, "PanelCloseAllCopies")
+        if "StopActiveCopyRounds();" not in panel_close_all:
+            fail(f"{name}: panel close-all must stop the active source round before closing")
         if "PanelSetPaused(true);" not in extract_function(source, "PanelDeleteAllPendings"):
             fail(f"{name}: panel delete-all must pause new entries first")
+        if "InpStopRoundAfterAllCopiesClosed" not in source:
+            fail(f"{name}: round-stop input is missing")
+        if "InpCopyDirection = COPY_DIRECTION_BOTH" not in source:
+            fail(f"{name}: direction filter must default to buy and sell")
+        for token in (
+            "ENTRY_TOTAL_FLOATING_LOSS = 3",
+            "InpEA1TotalLossMoney",
+            "InpEA2TotalLossMoney",
+            "profile.total_loss_money",
+        ):
+            if token not in source:
+                fail(f"{name}: total floating loss mode is incomplete: {token}")
+        load_profile = extract_function(source, "LoadProfile")
+        for token in (
+            "profile.total_loss_money = InpEA1TotalLossMoney",
+            "profile.total_loss_money = InpEA2TotalLossMoney",
+        ):
+            if token not in load_profile:
+                fail(f"{name}: total-loss profile loading is incomplete: {token}")
+        validate_profile = extract_function(source, "ValidateProfile")
+        if "profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS && profile.total_loss_money < 0.0" not in validate_profile:
+            fail(f"{name}: negative total-loss thresholds are not rejected")
+        process_source = extract_function(source, "ProcessSourceLevel")
+        if "IsCopyDirectionAllowed(source.position_type)" not in process_source:
+            fail(f"{name}: normal entries do not honor the direction filter")
+        if "IsGridGroupStopped(profile.profile_index, source.symbol, source.position_type)" not in process_source:
+            fail(f"{name}: non-grid entries do not honor the stopped source round")
+        grid_entries = extract_function(source, "CheckGridActivationEntries")
+        if "IsCopyDirectionAllowed(position_type)" not in grid_entries:
+            fail(f"{name}: grid entries do not honor the direction filter")
+        total_entries = extract_function(source, "CheckTotalLossActivationEntries")
+        if "ProcessTotalLossGroup(profile, source.symbol)" not in total_entries:
+            fail(f"{name}: total-loss groups are not processed")
+        total_group = extract_function(source, "ProcessTotalLossGroup")
+        for token in (
+            "MathMax(0.0, -total_profit_money)",
+            "profile.total_loss_money",
+            "SetTotalLossGroupActive",
+            "CopyTotalLossSources",
+        ):
+            if token not in total_group:
+                fail(f"{name}: total-loss activation is incomplete: {token}")
+        total_copy = extract_function(source, "CopyTotalLossSources")
+        for token in (
+            "IsCopyDirectionAllowed",
+            "IsAlreadyCopied",
+            "OpenCopyTrade",
+            "MarkCopied",
+        ):
+            if token not in total_copy:
+                fail(f"{name}: total-loss copy-all is incomplete: {token}")
+        if "grid_initial_max_copies" in total_copy:
+            fail(f"{name}: total-loss activation must copy all current source positions")
+        direction_filter = extract_function(source, "IsCopyDirectionAllowed")
+        for token in ("COPY_DIRECTION_BUY_ONLY", "COPY_DIRECTION_SELL_ONLY", "POSITION_TYPE_BUY", "POSITION_TYPE_SELL"):
+            if token not in direction_filter:
+                fail(f"{name}: incomplete direction filter: {token}")
+        check_positions = extract_function(source, "CheckPositions")
+        if check_positions.count("UpdateRoundCopyTracking();") != 2:
+            fail(f"{name}: copy-round tracking must run before and after entry processing")
+        if "CheckTotalLossActivationEntries();" not in check_positions:
+            fail(f"{name}: total-loss activation is not wired into receiver processing")
+        if "ResetInactiveTotalLossGroups();" not in check_positions:
+            fail(f"{name}: total-loss rounds are not reset")
+        reset_groups = extract_function(source, "ResetInactiveGridGroups")
+        if "profile.entry_mode == ENTRY_GRID_ACTIVATION" in reset_groups:
+            fail(f"{name}: stopped rounds would reset outside grid-activation mode")
         if "PanelDestroy();" not in extract_function(source, "OnDeinit"):
             fail(f"{name}: panel objects are not removed on deinitialization")
 
@@ -451,11 +549,16 @@ def main() -> int:
         if f"header.{field} = WinApiHeaderGetLong(bytes, {offset})" not in mt4_read_header:
             fail(f"mt4_winapi: header read offset mismatch for {field}")
 
-    for function_name in set(CORE_FUNCTIONS) - {"OpenCopyTrade"}:
+    for function_name in set(CORE_FUNCTIONS) - {"OpenCopyTrade", "SourcePositionProfitMoney"}:
         mt4_body = normalize_mt4_core(extract_function(mt4, function_name))
         mt5_body = normalize_core(extract_function(winapi, function_name))
         if mt4_body != mt5_body:
             fail(f"MT4/MT5 business logic drift in {function_name}")
+
+    mt4_total_money = extract_function(mt4, "SourcePositionProfitMoney")
+    for token in ("SYMBOL_TRADE_TICK_SIZE", "SYMBOL_TRADE_TICK_VALUE", "M4_POSITION_TYPE_BUY"):
+        if token not in mt4_total_money:
+            fail(f"mt4_winapi: total floating loss money calculation missing {token}")
 
     for function_name in PROTOCOL_SHARED_FUNCTIONS:
         mt4_body = normalize_mt4_core(extract_function(mt4, function_name))

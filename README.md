@@ -114,9 +114,27 @@ Sender 角色不创建面板。
 
 - `暂停新开/恢复新开`：只控制后续新开跟单，源单同步平仓、单笔盈利平仓和
   篮子盈利平仓继续执行；暂停状态按账户、Magic 和通道保存在终端全局变量中。
-- `全部平仓`：关闭当前 EA Magic/映射识别到的跟单持仓，并自动暂停新开。
+- `全部平仓`：关闭当前 EA Magic/映射识别到的跟单持仓，并锁定当前
+  `源EA + 品种 + 方向` 轮次；源端该组完全清空后自动解锁下一轮。
 - `删除挂单`：删除当前 EA 的跟单挂单，并自动暂停新开。
 - 平仓和删挂单使用 3 秒内二次点击确认，减少误触。
+
+默认 `InpStopRoundAfterAllCopiesClosed = true`：
+
+- 只手动平掉某一张跟单时，该源单的已跟标记保留，不会重复触发；同轮后续新增源单仍继续跟。
+- 当某个 `源EA + 品种 + 方向` 的跟单从有仓变为全部空仓，该组本轮锁定，
+  源端后续第 6、7 张等新单不再跟；源端该组全部平仓后自动清除锁定。
+- `暂停新开` 仍是全局手动开关；它和“本轮锁定”是两套独立状态。
+
+`InpCopyDirection` 用于限制 Receiver 新开跟单的方向，默认
+`COPY_DIRECTION_BOTH`：
+
+- `COPY_DIRECTION_BOTH`：买单、卖单都跟；
+- `COPY_DIRECTION_BUY_ONLY`：只跟买单；
+- `COPY_DIRECTION_SELL_ONLY`：只跟卖单。
+
+网格激活仍按 `源EA + 品种 + 方向` 分别计算组合均价和浮亏。买组达到浮亏阈值时
+只处理买组，不会因此把当时正在盈利的卖组一起复制。
 
 面板参数：`InpShowPanel`、`InpPanelCorner`、`InpPanelX`、`InpPanelY`、
 `InpPanelRefreshMs`。正式实盘前先在模拟盘验证按钮、券商 filling mode 和成交回报。
@@ -199,7 +217,7 @@ B 端 Sender 与 A 端 Receiver 使用 `B_to_A`。每个 Receiver 的源 EA Magi
 ## MT4↔MT4 / MT4↔MT5 WinAPI 版
 
 `WinApiMemoryLossFollow.mq4` 是 MT4 对端源码，和 MT5 的
-`WinApiMemoryLossFollow.mq5` v1.31 使用同一套 Windows named mapping、mutex、64 字节 header、
+`WinApiMemoryLossFollow.mq5` v1.34 使用同一套 Windows named mapping、mutex、64 字节 header、
 sequence、CRC32 和 `RLMC1` payload。文件扩展名按终端分别使用：
 
 - MT4：编译并挂载 `WinApiMemoryLossFollow.mq4`；
@@ -260,7 +278,8 @@ EA 当前支持 `源EA1` 和 `源EA2` 两套独立配置。
 
 ### `ENTRY_GRID_ACTIVATION`
 
-网格激活模式。按源 EA 的组合均价计算浮亏，达到档位 1 触发距离后激活：
+单向网格激活模式。按 `源EA + 品种 + 方向` 分别计算组合均价和浮亏，
+达到档位 1 触发距离后激活：
 
 - 激活前不跟单。
 - 激活时最多补跟 `GridInitialMaxCopies` 张已有源单。
@@ -268,6 +287,29 @@ EA 当前支持 `源EA1` 和 `源EA2` 两套独立配置。
 - 档位 2/3 在该模式下不参与。
 
 适合：网格、补仓、马丁、小止盈大止损类 EA。
+
+### `ENTRY_TOTAL_FLOATING_LOSS`
+
+净总浮亏激活模式。按 `源EA + 品种` 合并参数允许的买卖方向，以接收端当前报价、
+源单开仓价和源单手数估算净浮盈亏：
+
+```text
+净总浮亏 = max(0, -(全部允许方向浮盈亏之和))
+```
+
+- `InpEA1TotalLossMoney` / `InpEA2TotalLossMoney` 是触发金额，单位为接收账户货币；
+- 达到阈值后，一次复制当前全部允许方向源单，不受 `GridInitialMaxCopies` 限制；
+- 激活后，本轮后续新增的允许方向源单直接继续复制；
+- 源端该 `源EA + 品种` 的允许方向仓位全部清空后，状态重置，下一轮重新等待阈值；
+- `InpCopyDirection = COPY_DIRECTION_BOTH` 时买卖一起参与净值计算并一起复制；
+  只跟买或只跟卖时，仅对应方向参与计算和复制；
+- `0` 表示源组合出现后立即全跟。
+
+例如买单合计浮亏 120、卖单浮盈 30，则净总浮亏为 90；阈值设为 80 时，
+当前买卖源单全部复制，后续第 6、7 张源单继续直接复制。
+
+同机且两端账户货币、合约规格一致时金额最接近源端实际浮盈亏；账户货币或品种
+合约规格不同时，应先在模拟盘对照面板/日志校准触发金额。
 
 ## 浮亏距离模式
 

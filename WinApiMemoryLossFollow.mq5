@@ -3,7 +3,7 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.31"
+#property version   "1.34"
 #property description "Windows API共享内存跟单：统一角色切换，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
@@ -63,7 +63,15 @@ enum ENUM_COPY_ENTRY_MODE
 {
    ENTRY_MARKET_ON_TRIGGER = 0, // 持续监控，浮亏达到条件后市价入场
    ENTRY_PENDING_AT_TRIGGER = 1, // 源单出现后，在浮亏触发价提前挂单
-   ENTRY_GRID_ACTIVATION = 2     // 网格激活: 组合浮亏触发后补跟已有源单，后续新源单可直接跟
+   ENTRY_GRID_ACTIVATION = 2,    // 单向网格激活: 按买/卖方向分别计算组合浮亏
+   ENTRY_TOTAL_FLOATING_LOSS = 3 // 净总浮亏激活: 买卖合并达到货币阈值后全跟，后续全跟
+};
+
+enum ENUM_COPY_DIRECTION_FILTER
+{
+   COPY_DIRECTION_BOTH = 0,      // 买单和卖单都跟
+   COPY_DIRECTION_BUY_ONLY = 1,  // 只跟买单
+   COPY_DIRECTION_SELL_ONLY = 2  // 只跟卖单
 };
 
 enum ENUM_PROFIT_CHECK_MODE
@@ -116,6 +124,7 @@ struct SourceProfile
    double basket_profit_close_points;
    int grid_initial_max_copies;
    bool grid_stop_after_basket_close;
+   double total_loss_money;
 };
 
 struct MemorySourcePosition
@@ -191,6 +200,7 @@ input bool               InpEA1BasketProfitCloseEnabled = false; // 源EA1启用
 input double             InpEA1BasketProfitClosePoints  = 100.0; // 源EA1篮子均价盈利达到多少点后整篮子平仓
 input int                InpEA1GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
 input bool               InpEA1GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
+input double             InpEA1TotalLossMoney    = 100.0;        // 净总浮亏模式: 账户货币浮亏达到该金额后全跟，0=立即
 
 input group "源EA2设置"
 input bool               InpEA2Enabled           = false;        // 启用源EA2
@@ -234,14 +244,17 @@ input bool               InpEA2BasketProfitCloseEnabled = false; // 源EA2启用
 input double             InpEA2BasketProfitClosePoints  = 100.0; // 源EA2篮子均价盈利达到多少点后整篮子平仓
 input int                InpEA2GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
 input bool               InpEA2GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
+input double             InpEA2TotalLossMoney    = 100.0;        // 净总浮亏模式: 账户货币浮亏达到该金额后全跟，0=立即
 
 input group "跟单EA全局设置"
 input ulong              InpCopyMagic            = 2026062304;   // 跟单EA魔术号，必须和源EA不同
 input int                InpDeviationPoints      = 100;          // 允许滑点，单位为券商点数
 input string             InpSymbolMap            = "";           // 品种映射，源=跟单；多个用;分隔，例如 XAUUSD=XAUUSDm
+input ENUM_COPY_DIRECTION_FILTER InpCopyDirection = COPY_DIRECTION_BOTH; // 跟单方向：都跟/只跟买单/只跟卖单
 input bool               InpCloseCopyWithSource  = true;         // 源单平仓后跟单一起市价平仓
 input int                InpCloseRetrySeconds    = 3;            // 同一跟单平仓失败后的重试间隔秒数
 input bool               InpOneCopyPerPosition   = true;         // 每个源单只跟一次
+input bool               InpStopRoundAfterAllCopiesClosed = true; // 接收端本组跟单全部平仓后，本轮停跟至源端本组清空
 input int                InpScanIntervalMs       = 20;           // 共享内存读取周期，建议20毫秒；最低10毫秒
 input bool               InpBeijingFirstEntryTimeFilterEnabled = false; // 启用跟单首单北京时间过滤
 input string             InpBeijingFirstEntryTimeFilterRanges  = "04:00-10:00,18:00-23:30"; // 跟单空仓时禁止开首单的北京时间区间
@@ -283,6 +296,9 @@ bool g_panel_entries_paused = false;
 string g_panel_confirm_action = "";
 ulong g_panel_confirm_until_tick_ms = 0;
 string g_panel_last_action = "就绪";
+string g_round_copy_keys[];
+int g_round_copy_counts[];
+bool g_round_copy_tracking_ready = false;
 ulong g_sender_sequence = 0;
 datetime g_last_debug_print = 0;
 datetime g_last_error_print = 0;
@@ -768,6 +784,7 @@ void LoadProfile(const int index, SourceProfile& profile)
       profile.basket_profit_close_points = InpEA1BasketProfitClosePoints;
       profile.grid_initial_max_copies = InpEA1GridInitialMaxCopies;
       profile.grid_stop_after_basket_close = InpEA1GridStopAfterBasketClose;
+      profile.total_loss_money = InpEA1TotalLossMoney;
       return;
    }
 
@@ -813,6 +830,7 @@ void LoadProfile(const int index, SourceProfile& profile)
    profile.basket_profit_close_points = InpEA2BasketProfitClosePoints;
    profile.grid_initial_max_copies = InpEA2GridInitialMaxCopies;
    profile.grid_stop_after_basket_close = InpEA2GridStopAfterBasketClose;
+   profile.total_loss_money = InpEA2TotalLossMoney;
 }
 
 bool ValidateProfile(const int index, const SourceProfile& profile)
@@ -942,6 +960,12 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
          return false;
       }
 
+   }
+
+   if(profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS && profile.total_loss_money < 0.0)
+   {
+      PrintFormat("EA%d total floating loss money cannot be negative; 0 means immediate copy.", index);
+      return false;
    }
 
    if((profile.minute_profit_close_enabled || profile.basket_profit_close_enabled) &&
@@ -1077,6 +1101,7 @@ int InitMemoryReceiver()
 
    PanelInitialize();
    LoadMemorySnapshot(true);
+   UpdateRoundCopyTracking();
    return INIT_SUCCEEDED;
 }
 
@@ -1127,6 +1152,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       CloseCopiesWithoutSource();
       DeletePendingsWithoutSource();
       ResetInactiveGridGroups();
+      ResetInactiveTotalLossGroups();
    }
    PanelUpdate(true);
 }
@@ -1641,7 +1667,7 @@ bool PanelConfirmAction(const string action)
 
 void PanelCloseAllCopies()
 {
-   PanelSetPaused(true);
+   StopActiveCopyRounds();
    int success = 0;
    int failed = 0;
 
@@ -1663,7 +1689,7 @@ void PanelCloseAllCopies()
    }
 
    g_panel_last_action = "全部平仓完成：成功 " + IntegerToString(success) +
-                         "，失败 " + IntegerToString(failed) + "；已暂停新开";
+                         "，失败 " + IntegerToString(failed) + "；本轮停跟，源单清空后自动恢复";
 }
 
 void PanelDeleteAllPendings()
@@ -1734,7 +1760,13 @@ void CheckPositions()
    }
 
    if(fresh)
+   {
       ResetInactiveGridGroups();
+      ResetInactiveTotalLossGroups();
+   }
+
+   if(fresh)
+      UpdateRoundCopyTracking();
 
    CheckMinuteProfitClose();
    CheckBasketProfitClose();
@@ -1747,6 +1779,7 @@ void CheckPositions()
       return;
 
    CheckGridActivationEntries();
+   CheckTotalLossActivationEntries();
 
    int total = ArraySize(g_sources);
    for(int i = total - 1; i >= 0; i--)
@@ -1760,7 +1793,8 @@ void CheckPositions()
       if(!MatchSourceProfile(source_symbol, magic, comment, profile))
          continue;
 
-      if(profile.entry_mode == ENTRY_GRID_ACTIVATION)
+      if(profile.entry_mode == ENTRY_GRID_ACTIVATION ||
+         profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS)
          continue;
 
       ENUM_POSITION_TYPE position_type = source.position_type;
@@ -1771,6 +1805,8 @@ void CheckPositions()
       ProcessSourceLevel(source, profile, 2);
       ProcessSourceLevel(source, profile, 3);
    }
+
+   UpdateRoundCopyTracking();
 }
 
 void CheckGridActivationEntries()
@@ -1794,12 +1830,205 @@ void CheckGridActivationEntries()
       if(position_type != POSITION_TYPE_BUY && position_type != POSITION_TYPE_SELL)
          continue;
 
+      if(!IsCopyDirectionAllowed(position_type))
+         continue;
+
       string key = BasketKey(profile.profile_index, symbol, position_type);
       if(IsStringInArray(processed_keys, key))
          continue;
       AddString(processed_keys, key);
 
       ProcessGridGroup(profile, symbol, position_type);
+   }
+}
+
+void CheckTotalLossActivationEntries()
+{
+   string processed_keys[];
+   int total = ArraySize(g_sources);
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      SourceProfile profile;
+      if(!MatchSourceProfile(source.symbol, source.magic, source.comment, profile))
+         continue;
+
+      if(profile.entry_mode != ENTRY_TOTAL_FLOATING_LOSS)
+         continue;
+
+      if(!IsCopyDirectionAllowed(source.position_type))
+         continue;
+
+      string key = IntegerToString(profile.profile_index) + "|" + source.symbol;
+      if(IsStringInArray(processed_keys, key))
+         continue;
+      AddString(processed_keys, key);
+
+      ProcessTotalLossGroup(profile, source.symbol);
+   }
+}
+
+void ProcessTotalLossGroup(const SourceProfile& profile, const string source_symbol)
+{
+   string local_symbol = LocalSymbolForSource(source_symbol);
+   if(!EnsureSymbolReady(local_symbol))
+   {
+      PrintFormat("Skip total-loss group: local symbol is not available. source_symbol=%s local_symbol=%s profile=EA%d",
+                  source_symbol,
+                  local_symbol,
+                  profile.profile_index);
+      return;
+   }
+
+   int source_count = 0;
+   double total_profit_money = 0.0;
+   if(!SourceTotalLossStats(profile,
+                            source_symbol,
+                            local_symbol,
+                            source_count,
+                            total_profit_money))
+      return;
+
+   if(IsTotalLossGroupStopped(profile.profile_index, source_symbol))
+      return;
+
+   double total_loss_money = MathMax(0.0, -total_profit_money);
+   bool active = IsTotalLossGroupActive(profile.profile_index, source_symbol);
+   if(!active)
+   {
+      if(total_loss_money < profile.total_loss_money)
+         return;
+
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(0, local_symbol, 1, "total floating loss");
+         return;
+      }
+
+      SetTotalLossGroupActive(profile.profile_index, source_symbol);
+      if(InpPrintDebug)
+      {
+         PrintFormat("Total floating loss activated. profile=EA%d symbol=%s source_count=%d net_profit=%.2f loss=%.2f threshold=%.2f",
+                     profile.profile_index,
+                     source_symbol,
+                     source_count,
+                     total_profit_money,
+                     total_loss_money,
+                     profile.total_loss_money);
+      }
+   }
+
+   CopyTotalLossSources(profile, source_symbol, local_symbol);
+}
+
+bool SourceTotalLossStats(const SourceProfile& profile,
+                          const string source_symbol,
+                          const string local_symbol,
+                          int& source_count,
+                          double& total_profit_money)
+{
+   source_count = 0;
+   total_profit_money = 0.0;
+
+   int total = ArraySize(g_sources);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source))
+         continue;
+      if(source.symbol != source_symbol)
+         continue;
+      if(!IsCopyDirectionAllowed(source.position_type))
+         continue;
+
+      source_count++;
+      total_profit_money += SourcePositionProfitMoney(local_symbol,
+                                                     source.position_type,
+                                                     source.open_price,
+                                                     source.volume);
+   }
+
+   return source_count > 0;
+}
+
+double SourcePositionProfitMoney(const string symbol,
+                                 const ENUM_POSITION_TYPE position_type,
+                                 const double open_price,
+                                 const double volume)
+{
+   if(!EnsureSymbolReady(symbol) || volume <= 0.0)
+      return 0.0;
+
+   double tick_size = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tick_value_profit = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_PROFIT);
+   double tick_value_loss = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE_LOSS);
+   double fallback_tick_value = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tick_value_profit <= 0.0)
+      tick_value_profit = fallback_tick_value;
+   if(tick_value_loss <= 0.0)
+      tick_value_loss = fallback_tick_value;
+   if(tick_size <= 0.0 || tick_value_profit <= 0.0 || tick_value_loss <= 0.0)
+      return 0.0;
+
+   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
+   double price_delta = position_type == POSITION_TYPE_BUY
+                        ? bid - open_price
+                        : open_price - ask;
+   double tick_value = price_delta >= 0.0 ? tick_value_profit : tick_value_loss;
+   return price_delta / tick_size * tick_value * volume;
+}
+
+void CopyTotalLossSources(const SourceProfile& profile,
+                          const string source_symbol,
+                          const string local_symbol)
+{
+   int total = ArraySize(g_sources);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      ulong source_ticket = source.source_id;
+
+      if(!IsSourcePositionForProfile(profile, source))
+         continue;
+      if(source.symbol != source_symbol)
+         continue;
+      if(!IsCopyDirectionAllowed(source.position_type))
+         continue;
+      if(IsAlreadyCopied(source_ticket, 1))
+         continue;
+
+      double volume = CalculateCopyVolume(local_symbol, source.volume, profile, 1);
+      if(volume <= 0.0)
+      {
+         PrintFormat("Skip total-loss source #%I64u: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f",
+                     source_ticket,
+                     source_symbol,
+                     local_symbol,
+                     source.volume);
+         continue;
+      }
+
+      if(IsFirstCopyEntryTimeBlocked())
+      {
+         LogFirstEntryTimeFilterSkip(source_ticket, local_symbol, 1, "total floating loss copy");
+         return;
+      }
+
+      double loss_points = FloatingLossPoints(local_symbol, source.position_type, source.open_price);
+      double loss_price = loss_points * SymbolInfoDouble(local_symbol, SYMBOL_POINT);
+      if(OpenCopyTrade(source_ticket,
+                       local_symbol,
+                       source.position_type,
+                       volume,
+                       source.sl,
+                       source.tp,
+                       loss_points,
+                       loss_price,
+                       profile,
+                       1))
+         MarkCopied(source_ticket, 1);
    }
 }
 
@@ -2029,6 +2258,13 @@ void ProcessSourceLevel(const MemorySourcePosition& source, const SourceProfile&
    if(!IsLevelEnabled(profile, level_index))
       return;
 
+   if(!IsCopyDirectionAllowed(source.position_type))
+      return;
+
+   if(InpStopRoundAfterAllCopiesClosed &&
+      IsGridGroupStopped(profile.profile_index, source.symbol, source.position_type))
+      return;
+
    ulong source_ticket = source.source_id;
    if((profile.entry_mode == ENTRY_PENDING_AT_TRIGGER || InpOneCopyPerPosition) && IsAlreadyCopied(source_ticket, level_index))
       return;
@@ -2132,6 +2368,17 @@ bool IsLevelEnabled(const SourceProfile& profile, const int level_index)
       return profile.level2_enabled;
 
    return profile.level3_enabled;
+}
+
+bool IsCopyDirectionAllowed(const ENUM_POSITION_TYPE position_type)
+{
+   if(InpCopyDirection == COPY_DIRECTION_BUY_ONLY)
+      return position_type == POSITION_TYPE_BUY;
+
+   if(InpCopyDirection == COPY_DIRECTION_SELL_ONLY)
+      return position_type == POSITION_TYPE_SELL;
+
+   return position_type == POSITION_TYPE_BUY || position_type == POSITION_TYPE_SELL;
 }
 
 ENUM_LOSS_TRIGGER_MODE LevelLossMode(const SourceProfile& profile, const int level_index)
@@ -2667,6 +2914,243 @@ string BasketKey(const int profile_index, const string symbol, const ENUM_POSITI
    return IntegerToString(profile_index) + "|" + symbol + "|" + IntegerToString((int)position_type);
 }
 
+string TotalLossBasketKey(const int profile_index, const string symbol)
+{
+   return IntegerToString(profile_index) + "|" + symbol + "|T";
+}
+
+string RoundTrackingKey(const SourceProfile& profile, const MemorySourcePosition& source)
+{
+   if(profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS)
+      return TotalLossBasketKey(profile.profile_index, source.symbol);
+
+   return BasketKey(profile.profile_index, source.symbol, source.position_type);
+}
+
+int RoundKeyIndex(const string &keys[], const string key)
+{
+   int total = ArraySize(keys);
+   for(int i = 0; i < total; i++)
+   {
+      if(keys[i] == key)
+         return i;
+   }
+   return -1;
+}
+
+void AddRoundCopyCount(string &keys[], int &counts[], const string key)
+{
+   int index = RoundKeyIndex(keys, key);
+   if(index >= 0)
+   {
+      counts[index]++;
+      return;
+   }
+
+   int total = ArraySize(keys);
+   ArrayResize(keys, total + 1);
+   ArrayResize(counts, total + 1);
+   keys[total] = key;
+   counts[total] = 1;
+}
+
+bool ParseBasketKey(const string key,
+                    int& profile_index,
+                    string& symbol,
+                    ENUM_POSITION_TYPE& position_type)
+{
+   string parts[];
+   int count = StringSplit(key, '|', parts);
+   if(count != 3)
+      return false;
+
+   profile_index = (int)StringToInteger(parts[0]);
+   symbol = parts[1];
+   position_type = (ENUM_POSITION_TYPE)StringToInteger(parts[2]);
+   return profile_index > 0 && symbol != "";
+}
+
+bool ParseRoundTrackingKey(const string key,
+                           int& profile_index,
+                           string& symbol,
+                           ENUM_POSITION_TYPE& position_type,
+                           bool& total_loss_group)
+{
+   string parts[];
+   int count = StringSplit(key, '|', parts);
+   if(count != 3)
+      return false;
+
+   profile_index = (int)StringToInteger(parts[0]);
+   symbol = parts[1];
+   total_loss_group = parts[2] == "T";
+   position_type = total_loss_group
+                   ? POSITION_TYPE_BUY
+                   : (ENUM_POSITION_TYPE)StringToInteger(parts[2]);
+   return profile_index > 0 && symbol != "";
+}
+
+bool SourceRoundExists(const int profile_index,
+                       const string symbol,
+                       const ENUM_POSITION_TYPE position_type)
+{
+   if(profile_index < 1 || profile_index > 2)
+      return false;
+
+   SourceProfile profile;
+   LoadProfile(profile_index, profile);
+   if(!profile.enabled)
+      return false;
+
+   int source_count = 0;
+   double source_volume = 0.0;
+   double weighted_open = 0.0;
+   return SourceGroupStats(profile,
+                           symbol,
+                           position_type,
+                           source_count,
+                           source_volume,
+                           weighted_open);
+}
+
+bool SourceTotalLossRoundExists(const int profile_index, const string symbol)
+{
+   if(profile_index < 1 || profile_index > 2)
+      return false;
+
+   SourceProfile profile;
+   LoadProfile(profile_index, profile);
+   if(!profile.enabled)
+      return false;
+
+   int total = ArraySize(g_sources);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(source.symbol == symbol &&
+         IsCopyDirectionAllowed(source.position_type) &&
+         IsSourcePositionForProfile(profile, source))
+         return true;
+   }
+   return false;
+}
+
+void StopActiveCopyRounds()
+{
+   if(!InpStopRoundAfterAllCopiesClosed || !g_snapshot_fresh)
+      return;
+
+   string stopped_keys[];
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+      if(!IsCopyPosition())
+         continue;
+
+      MemorySourcePosition source;
+      if(!MemorySourceById(SourceTicketFromCurrentPosition(), source))
+         continue;
+
+      SourceProfile profile;
+      if(!MatchSourceProfile(source.symbol, source.magic, source.comment, profile))
+         continue;
+
+      string key = RoundTrackingKey(profile, source);
+      if(RoundKeyIndex(stopped_keys, key) >= 0)
+         continue;
+
+      AddString(stopped_keys, key);
+      if(profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS)
+         SetTotalLossGroupStopped(profile.profile_index, source.symbol);
+      else
+         SetGridGroupStopped(profile.profile_index, source.symbol, source.position_type);
+   }
+}
+
+void UpdateRoundCopyTracking()
+{
+   if(!InpStopRoundAfterAllCopiesClosed || !g_snapshot_fresh)
+      return;
+
+   string current_keys[];
+   int current_counts[];
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+      if(!IsCopyPosition())
+         continue;
+
+      MemorySourcePosition source;
+      if(!MemorySourceById(SourceTicketFromCurrentPosition(), source))
+         continue;
+
+      SourceProfile profile;
+      if(!MatchSourceProfile(source.symbol, source.magic, source.comment, profile))
+         continue;
+
+      AddRoundCopyCount(current_keys,
+                        current_counts,
+                        RoundTrackingKey(profile, source));
+   }
+
+   if(g_round_copy_tracking_ready)
+   {
+      int previous_total = ArraySize(g_round_copy_keys);
+      for(int i = 0; i < previous_total; i++)
+      {
+         if(g_round_copy_counts[i] <= 0 || RoundKeyIndex(current_keys, g_round_copy_keys[i]) >= 0)
+            continue;
+
+         int profile_index = 0;
+         string symbol = "";
+         ENUM_POSITION_TYPE position_type = POSITION_TYPE_BUY;
+         bool total_loss_group = false;
+         if(!ParseRoundTrackingKey(g_round_copy_keys[i],
+                                   profile_index,
+                                   symbol,
+                                   position_type,
+                                   total_loss_group))
+            continue;
+
+         bool source_round_exists = total_loss_group
+                                    ? SourceTotalLossRoundExists(profile_index, symbol)
+                                    : SourceRoundExists(profile_index, symbol, position_type);
+         if(source_round_exists)
+         {
+            if(total_loss_group)
+               SetTotalLossGroupStopped(profile_index, symbol);
+            else
+               SetGridGroupStopped(profile_index, symbol, position_type);
+
+            if(InpPrintDebug)
+            {
+               PrintFormat("Copy group fully closed; stop current source round. profile=EA%d symbol=%s type=%s",
+                           profile_index,
+                           symbol,
+                           total_loss_group
+                           ? "BOTH"
+                           : (position_type == POSITION_TYPE_BUY ? "BUY" : "SELL"));
+            }
+         }
+      }
+   }
+
+   ArrayResize(g_round_copy_keys, ArraySize(current_keys));
+   ArrayResize(g_round_copy_counts, ArraySize(current_counts));
+   for(int i = 0; i < ArraySize(current_keys); i++)
+   {
+      g_round_copy_keys[i] = current_keys[i];
+      g_round_copy_counts[i] = current_counts[i];
+   }
+   g_round_copy_tracking_ready = true;
+}
+
 string GridStatePrefix(const string state)
 {
    return g_prefix + "GRID_" + state + "_" + IntegerToString((long)InpCopyMagic) + "_";
@@ -2706,6 +3190,59 @@ void ClearGridGroupActive(const int profile_index, const string symbol, const EN
 void SetGridGroupStopped(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
 {
    GlobalVariableSet(GridGroupStateName("S", profile_index, symbol, position_type), (double)TimeCurrent());
+}
+
+string TotalLossStatePrefix(const string state)
+{
+   return g_prefix + "TOTAL_" + state + "_" + IntegerToString((long)InpCopyMagic) + "_";
+}
+
+string TotalLossGroupStateName(const string state, const int profile_index, const string symbol)
+{
+   return TotalLossStatePrefix(state) + IntegerToString(profile_index) + "_" + symbol;
+}
+
+bool IsTotalLossGroupActive(const int profile_index, const string symbol)
+{
+   return GlobalVariableCheck(TotalLossGroupStateName("A", profile_index, symbol));
+}
+
+bool IsTotalLossGroupStopped(const int profile_index, const string symbol)
+{
+   return GlobalVariableCheck(TotalLossGroupStateName("S", profile_index, symbol));
+}
+
+void SetTotalLossGroupActive(const int profile_index, const string symbol)
+{
+   GlobalVariableSet(TotalLossGroupStateName("A", profile_index, symbol), (double)TimeCurrent());
+}
+
+void SetTotalLossGroupStopped(const int profile_index, const string symbol)
+{
+   GlobalVariableSet(TotalLossGroupStateName("S", profile_index, symbol), (double)TimeCurrent());
+}
+
+bool ParseTotalLossStateName(const string name, int& profile_index, string& symbol)
+{
+   string active_prefix = TotalLossStatePrefix("A");
+   string stopped_prefix = TotalLossStatePrefix("S");
+   string prefix = "";
+
+   if(StringFind(name, active_prefix) == 0)
+      prefix = active_prefix;
+   else if(StringFind(name, stopped_prefix) == 0)
+      prefix = stopped_prefix;
+   else
+      return false;
+
+   string tail = StringSubstr(name, StringLen(prefix));
+   int separator = StringFind(tail, "_");
+   if(separator <= 0 || separator >= StringLen(tail) - 1)
+      return false;
+
+   profile_index = (int)StringToInteger(StringSubstr(tail, 0, separator));
+   symbol = StringSubstr(tail, separator + 1);
+   return profile_index > 0 && symbol != "";
 }
 
 bool ParseGridStateName(const string name,
@@ -2763,12 +3300,32 @@ void ResetInactiveGridGroups()
       double source_volume = 0.0;
       double weighted_open = 0.0;
       if(profile.enabled &&
-         profile.entry_mode == ENTRY_GRID_ACTIVATION &&
          SourceGroupStats(profile, symbol, position_type, source_count, source_volume, weighted_open))
          continue;
 
       GlobalVariableDel(GridGroupStateName("A", profile_index, symbol, position_type));
       GlobalVariableDel(GridGroupStateName("S", profile_index, symbol, position_type));
+   }
+}
+
+void ResetInactiveTotalLossGroups()
+{
+   int total = GlobalVariablesTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      int profile_index = 0;
+      string symbol = "";
+      if(!ParseTotalLossStateName(name, profile_index, symbol))
+         continue;
+
+      if(profile_index >= 1 &&
+         profile_index <= 2 &&
+         SourceTotalLossRoundExists(profile_index, symbol))
+         continue;
+
+      GlobalVariableDel(TotalLossGroupStateName("A", profile_index, symbol));
+      GlobalVariableDel(TotalLossGroupStateName("S", profile_index, symbol));
    }
 }
 
