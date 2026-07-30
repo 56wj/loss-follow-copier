@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static regression checks for the three unified copy-trading variants."""
+"""Static regression checks for MT5 variants and the MT4 WinAPI peer."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ FILES = {
     "winapi_memory": ROOT / "WinApiMemoryLossFollow.mq5",
     "file_snapshot": ROOT / "FileLossFollow.mq5",
 }
+MT4_WINAPI = ROOT / "WinApiMemoryLossFollow.mq4"
 
 EVENTS = (
     "OnInit",
@@ -43,6 +44,17 @@ CORE_FUNCTIONS = (
     "PanelCloseAllCopies",
     "PanelDeleteAllPendings",
     "PanelHandleChartEvent",
+)
+PROTOCOL_SHARED_FUNCTIONS = (
+    "WinApiMemoryCrc32",
+    "WinApiMemoryNameHash",
+    "WinApiMemoryObjectPart",
+    "SenderBuildSnapshotText",
+    "SenderWritePausedSnapshot",
+    "SenderPublishPayload",
+    "EscapeMemoryField",
+    "ParseMemorySnapshot",
+    "UnescapeMemoryField",
 )
 
 
@@ -173,6 +185,30 @@ def normalize_core(source: str) -> str:
     return re.sub(r"\s+", "", normalized)
 
 
+def normalize_mt4_core(source: str) -> str:
+    replacements = (
+        ("M4PositionsTotal", "PositionsTotal"),
+        ("M4PositionGetTicket", "PositionGetTicket"),
+        ("M4PositionSelectByTicket", "PositionSelectByTicket"),
+        ("M4PositionGetInteger", "PositionGetInteger"),
+        ("M4PositionGetDouble", "PositionGetDouble"),
+        ("M4PositionGetString", "PositionGetString"),
+        ("M4PendingOrdersTotal", "OrdersTotal"),
+        ("M4PendingOrderGetTicket", "OrderGetTicket"),
+        ("M4PendingOrderSelectByTicket", "OrderSelect"),
+        ("M4PendingOrderGetInteger", "OrderGetInteger"),
+        ("M4PendingOrderGetString", "OrderGetString"),
+        ("ENUM_M4_POSITION_TYPE", "ENUM_POSITION_TYPE"),
+        ("M4_POSITION_", "POSITION_"),
+        ("M4_ORDER_", "ORDER_"),
+    )
+    normalized = source
+    for old, new in replacements:
+        normalized = normalized.replace(old, new)
+    normalized = mask_comments_and_strings(normalized)
+    return re.sub(r"\s+", "", normalized)
+
+
 def imports(source: str) -> list[str]:
     return re.findall(r'#import\s+"([^"]+)"', source)
 
@@ -227,6 +263,8 @@ def main() -> int:
         "another Receiver already owns this channel/account/magic",
         "WinApiMemoryNameHash",
         "InpSenderExcludeOwnCopies",
+        "WINAPI_MEMORY_HEADER_SIZE   64",
+        "sizeof(WinApiMemoryHeader) != WINAPI_MEMORY_HEADER_SIZE",
         "RLMC1",
     ):
         if token not in winapi:
@@ -308,12 +346,125 @@ def main() -> int:
         if "PanelDestroy();" not in extract_function(source, "OnDeinit"):
             fail(f"{name}: panel objects are not removed on deinitialization")
 
+    if not MT4_WINAPI.is_file():
+        fail(f"mt4_winapi: missing {MT4_WINAPI.name}")
+    mt4 = MT4_WINAPI.read_text(encoding="utf-8-sig")
+    check_delimiters("mt4_winapi", mt4)
+    mt4_functions = function_names(mt4)
+    mt4_required = set(EVENTS + CORE_FUNCTIONS) - {"OnTradeTransaction"}
+    missing = sorted(mt4_required - mt4_functions)
+    if missing:
+        fail(f"mt4_winapi: missing functions: {', '.join(missing)}")
+    for event in set(EVENTS) - {"OnTradeTransaction"}:
+        count = len(re.findall(rf"(?m)^\s*\w[\w\s&<>]*\b{event}\s*\(", mt4))
+        if count != 1:
+            fail(f"mt4_winapi: expected one {event}, found {count}")
+
+    if imports(mt4) != ["kernel32.dll"]:
+        fail("mt4_winapi: unexpected imports")
+    for token in (
+        "WINAPI_MEMORY_HEADER_SIZE   64",
+        "WinApiHeaderPutLong",
+        "WinApiHeaderGetLong",
+        "GetTickCount64",
+        'Local\\\\MQL5_WMLF_MAP_',
+        'Local\\\\MQL5_WMLF_MUTEX_',
+        "RLMC1",
+        "M4PositionsTotal",
+        "M4PendingOrdersTotal",
+        "M4RefreshTradeCache",
+        "M4InvalidateTradeCache",
+        "OrderSend(symbol",
+        "OrderClose((int)copy_ticket",
+        "OrderDelete((int)order_ticket",
+        "InpSenderExcludeOwnCopies",
+    ):
+        if token not in mt4:
+            fail(f"mt4_winapi: missing {token}")
+    for token in (
+        "MqlTradeRequest",
+        "MqlTradeResult",
+        "OnTradeTransaction",
+        "StructToCharArray",
+        "CharArrayToStruct",
+        "_IsX64",
+        "FILE_COMMON",
+        "input group",
+    ):
+        if token in mt4:
+            fail(f"mt4_winapi: MQL5-only or mixed transport token found: {token}")
+
+    if copy_magic(mt4) != copy_magic(winapi):
+        fail("mt4_winapi: copy magic must match MT5 WinAPI for loop suppression")
+
+    mt4_open = extract_function(mt4, "WinApiMemoryOpen")
+    mt4_mapping_index = mt4_open.find("CreateFileMappingW")
+    for role in ("writer", "receiver"):
+        guard_index = mt4_open.find(f"WinApiMemoryAcquireGuard({role}_guard_name")
+        if guard_index < 0 or mt4_mapping_index < 0 or guard_index > mt4_mapping_index:
+            fail(f"mt4_winapi: {role} guard must be acquired before opening the mapping")
+
+    mt4_close = extract_function(mt4, "WinApiMemoryClose")
+    for token in (
+        "ReleaseMutex(g_winapi_writer_guard_handle)",
+        "ReleaseMutex(g_winapi_receiver_guard_handle)",
+        "CloseHandle(g_winapi_writer_guard_handle)",
+        "CloseHandle(g_winapi_receiver_guard_handle)",
+    ):
+        if token not in mt4_close:
+            fail(f"mt4_winapi: role guard cleanup missing: {token}")
+
+    for init_name in ("InitMemorySender", "InitMemoryReceiver"):
+        init_body = extract_function(mt4, init_name)
+        if "if(!EventSetMillisecondTimer" not in init_body or "WinApiMemoryClose();" not in init_body:
+            fail(f"mt4_winapi: {init_name} must fail closed when the timer cannot start")
+
+    header_offsets = {
+        "magic": 0,
+        "version": 8,
+        "sequence": 16,
+        "publish_tick_ms": 24,
+        "payload_size": 32,
+        "payload_crc32": 40,
+        "capacity_bytes": 48,
+        "reserved": 56,
+    }
+    mt5_header_match = re.search(r"struct\s+WinApiMemoryHeader\s*\{([^}]*)\}", winapi, re.DOTALL)
+    if not mt5_header_match:
+        fail("winapi_memory: WinApiMemoryHeader definition missing")
+    mt5_header_fields = re.findall(r"\blong\s+(\w+)\s*;", mt5_header_match.group(1))
+    if mt5_header_fields != list(header_offsets):
+        fail(f"winapi_memory: shared header field order changed: {mt5_header_fields}")
+    mt4_write_header = extract_function(mt4, "WinApiWriteHeader")
+    mt4_read_header = extract_function(mt4, "WinApiReadHeader")
+    for field, offset in header_offsets.items():
+        if f"WinApiHeaderPutLong(bytes, {offset}, header.{field})" not in mt4_write_header:
+            fail(f"mt4_winapi: header write offset mismatch for {field}")
+        if f"header.{field} = WinApiHeaderGetLong(bytes, {offset})" not in mt4_read_header:
+            fail(f"mt4_winapi: header read offset mismatch for {field}")
+
+    for function_name in set(CORE_FUNCTIONS) - {"OpenCopyTrade"}:
+        mt4_body = normalize_mt4_core(extract_function(mt4, function_name))
+        mt5_body = normalize_core(extract_function(winapi, function_name))
+        if mt4_body != mt5_body:
+            fail(f"MT4/MT5 business logic drift in {function_name}")
+
+    for function_name in PROTOCOL_SHARED_FUNCTIONS:
+        mt4_body = normalize_mt4_core(extract_function(mt4, function_name))
+        mt5_body = normalize_core(extract_function(winapi, function_name))
+        if mt4_body != mt5_body:
+            fail(f"MT4/MT5 protocol drift in {function_name}")
+
     print("EA variant validation OK")
     for name in FILES:
         print(
             f"  {name}: functions={len(functions[name])} "
             f"magic={magics[name]} imports={imports(sources[name]) or ['none']}"
         )
+    print(
+        f"  mt4_winapi: functions={len(mt4_functions)} "
+        f"magic={copy_magic(mt4)} imports={imports(mt4)}"
+    )
     return 0
 
 

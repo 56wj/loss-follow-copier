@@ -1,22 +1,23 @@
 ﻿//+------------------------------------------------------------------+
-//|                                    WinApiMemoryLossFollow.mq5    |
+//|                                    WinApiMemoryLossFollow.mq4    |
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.30"
-#property description "Windows API共享内存跟单：统一角色切换，Receiver内嵌控制面板。"
+#property version   "1.00"
+#property description "MT4 Windows API共享内存跟单：兼容MT5通道，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
-long CreateFileMappingW(long file_handle, long security_attributes, uint protect, uint maximum_size_high, uint maximum_size_low, string object_name);
-long MapViewOfFile(long mapping_handle, uint desired_access, uint file_offset_high, uint file_offset_low, ulong bytes_to_map);
-int  UnmapViewOfFile(long base_address);
-int  CloseHandle(long object_handle);
-long CreateMutexW(long mutex_attributes, int initial_owner, string object_name);
-uint WaitForSingleObject(long object_handle, uint milliseconds);
-int  ReleaseMutex(long mutex_handle);
-long GetCurrentProcess();
-int  WriteProcessMemory(long process_handle, long base_address, uchar &buffer[], ulong size, ulong &bytes_written);
-int  ReadProcessMemory(long process_handle, long base_address, uchar &buffer[], ulong size, ulong &bytes_read);
+int   CreateFileMappingW(int file_handle, int security_attributes, uint protect, uint maximum_size_high, uint maximum_size_low, string object_name);
+int   MapViewOfFile(int mapping_handle, uint desired_access, uint file_offset_high, uint file_offset_low, uint bytes_to_map);
+int   UnmapViewOfFile(int base_address);
+int   CloseHandle(int object_handle);
+int   CreateMutexW(int mutex_attributes, int initial_owner, string object_name);
+uint  WaitForSingleObject(int object_handle, uint milliseconds);
+int   ReleaseMutex(int mutex_handle);
+int   GetCurrentProcess();
+ulong GetTickCount64();
+int   WriteProcessMemory(int process_handle, int base_address, uchar &buffer[], uint size, uint &bytes_written);
+int   ReadProcessMemory(int process_handle, int base_address, uchar &buffer[], uint size, uint &bytes_read);
 #import
 
 #define WINAPI_PAGE_READWRITE       0x00000004
@@ -27,6 +28,28 @@ int  ReadProcessMemory(long process_handle, long base_address, uchar &buffer[], 
 #define WINAPI_MEMORY_MAGIC         0x574D4C46
 #define WINAPI_MEMORY_VERSION       1
 #define WINAPI_MEMORY_HEADER_SIZE   64
+
+#define M4_POSITION_IDENTIFIER      1
+#define M4_POSITION_MAGIC           2
+#define M4_POSITION_TICKET          3
+#define M4_POSITION_TIME            4
+#define M4_POSITION_TYPE            5
+#define M4_POSITION_PRICE_OPEN      6
+#define M4_POSITION_PROFIT          7
+#define M4_POSITION_SL              8
+#define M4_POSITION_SWAP            9
+#define M4_POSITION_TP              10
+#define M4_POSITION_VOLUME          11
+#define M4_POSITION_COMMENT         12
+#define M4_POSITION_SYMBOL          13
+#define M4_ORDER_MAGIC              14
+#define M4_ORDER_COMMENT            15
+
+enum ENUM_M4_POSITION_TYPE
+{
+   M4_POSITION_TYPE_BUY = 0,
+   M4_POSITION_TYPE_SELL = 1
+};
 
 struct WinApiMemoryHeader
 {
@@ -123,7 +146,7 @@ struct MemorySourcePosition
    ulong source_id;
    ulong ticket;
    string symbol;
-   ENUM_POSITION_TYPE position_type;
+   ENUM_M4_POSITION_TYPE position_type;
    long magic;
    string comment;
    double volume;
@@ -133,23 +156,23 @@ struct MemorySourcePosition
    datetime open_time;
 };
 
-input group "运行角色"
+//--- group "运行角色"
 input ENUM_MEMORY_FOLLOW_ROLE InpMemoryRole      = MEMORY_FOLLOW_RECEIVER; // Sender或Receiver
 
-input group "共享内存通道"
+//--- group "共享内存通道"
 input string             InpChannelName          = "loss_follow_winapi_1"; // 两个终端必须一致
 input int                InpSharedMemoryCapacityKB = 1024;                  // 两端必须一致，范围64~16384KB
 
-input group "发送端设置（仅Sender角色）"
+//--- group "发送端设置（仅Sender角色）"
 input string             InpSenderAllowedSymbols = "";                     // 发布品种，空表示全部
 input bool               InpSenderExcludeOwnCopies = true;                 // 不回传本版本跟单仓，双向互跟时防止循环复制
 input int                InpSenderPublishIntervalMs = 20;                   // 建议20毫秒；最低10毫秒
 input bool               InpSenderPauseWhenAutoTradingOff = true;           // 自动交易关闭时发布暂停状态
 
-input group "接收端设置（仅Receiver角色）"
+//--- group "接收端设置（仅Receiver角色）"
 input int                InpSourceStaleMilliseconds = 3000;                 // 超时后停止新开单及源单同步平仓
 
-input group "源EA1设置"
+//--- group "源EA1设置"
 input bool               InpEA1Enabled           = true;         // 启用源EA1
 input long               InpEA1Magic             = 123456;       // 源EA1魔术号，-1表示不限制魔术号
 input string             InpEA1CommentFilter     = "";           // 源EA1注释模糊匹配，空表示不限制
@@ -192,7 +215,7 @@ input double             InpEA1BasketProfitClosePoints  = 100.0; // 源EA1篮子
 input int                InpEA1GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
 input bool               InpEA1GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
 
-input group "源EA2设置"
+//--- group "源EA2设置"
 input bool               InpEA2Enabled           = false;        // 启用源EA2
 input long               InpEA2Magic             = 654321;       // 源EA2魔术号，-1表示不限制魔术号
 input string             InpEA2CommentFilter     = "";           // 源EA2注释模糊匹配，空表示不限制
@@ -235,7 +258,7 @@ input double             InpEA2BasketProfitClosePoints  = 100.0; // 源EA2篮子
 input int                InpEA2GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
 input bool               InpEA2GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
 
-input group "跟单EA全局设置"
+//--- group "跟单EA全局设置"
 input ulong              InpCopyMagic            = 2026062304;   // 跟单EA魔术号，必须和源EA不同
 input int                InpDeviationPoints      = 100;          // 允许滑点，单位为券商点数
 input string             InpSymbolMap            = "";           // 品种映射，源=跟单；多个用;分隔，例如 XAUUSD=XAUUSDm
@@ -247,7 +270,7 @@ input bool               InpBeijingFirstEntryTimeFilterEnabled = false; // 启�
 input string             InpBeijingFirstEntryTimeFilterRanges  = "04:00-10:00,18:00-23:30"; // 跟单空仓时禁止开首单的北京时间区间
 input bool               InpPrintDebug           = false;        // 打印调试日志；追求速度时关闭
 
-input group "图表跟单面板（仅Receiver）"
+//--- group "图表跟单面板（仅Receiver）"
 input bool               InpShowPanel            = true;         // 在Receiver图表显示内嵌跟单面板
 input ENUM_BASE_CORNER   InpPanelCorner          = CORNER_LEFT_UPPER; // 面板所在角落
 input int                InpPanelX               = 10;           // 面板水平偏移
@@ -257,14 +280,14 @@ input int                InpPanelRefreshMs       = 250;          // 面板刷新
 string g_prefix;
 int g_memory_capacity_bytes = 0;
 uchar g_memory_buffer[];
-long g_winapi_mapping_handle = 0;
-long g_winapi_view_address = 0;
-long g_winapi_mutex_handle = 0;
-long g_winapi_writer_guard_handle = 0;
+int g_winapi_mapping_handle = 0;
+int g_winapi_view_address = 0;
+int g_winapi_mutex_handle = 0;
+int g_winapi_writer_guard_handle = 0;
 bool g_winapi_writer_guard_owned = false;
-long g_winapi_receiver_guard_handle = 0;
+int g_winapi_receiver_guard_handle = 0;
 bool g_winapi_receiver_guard_owned = false;
-long g_winapi_process_handle = 0;
+int g_winapi_process_handle = 0;
 ulong g_winapi_last_read_sequence = 0;
 int g_winapi_last_error = 0;
 MemorySourcePosition g_sources[];
@@ -286,6 +309,161 @@ string g_panel_last_action = "就绪";
 ulong g_sender_sequence = 0;
 datetime g_last_debug_print = 0;
 datetime g_last_error_print = 0;
+ulong g_m4_trade_cache_tick_ms = 0;
+ulong g_m4_position_tickets[];
+ulong g_m4_pending_tickets[];
+
+bool M4IsMarketOrderType(const int order_type)
+{
+   return order_type == OP_BUY || order_type == OP_SELL;
+}
+
+bool M4IsPendingOrderType(const int order_type)
+{
+   return order_type == OP_BUYLIMIT ||
+          order_type == OP_SELLLIMIT ||
+          order_type == OP_BUYSTOP ||
+          order_type == OP_SELLSTOP;
+}
+
+void M4InvalidateTradeCache()
+{
+   g_m4_trade_cache_tick_ms = 0;
+   ArrayResize(g_m4_position_tickets, 0);
+   ArrayResize(g_m4_pending_tickets, 0);
+}
+
+void M4RefreshTradeCache()
+{
+   ulong now_tick_ms = GetTickCount64();
+   if(g_m4_trade_cache_tick_ms > 0 &&
+      now_tick_ms >= g_m4_trade_cache_tick_ms &&
+      now_tick_ms - g_m4_trade_cache_tick_ms <= 2)
+      return;
+
+   ArrayResize(g_m4_position_tickets, 0);
+   ArrayResize(g_m4_pending_tickets, 0);
+   int total = OrdersTotal();
+   for(int i = 0; i < total; i++)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+
+      int count = 0;
+      if(M4IsMarketOrderType(OrderType()))
+      {
+         count = ArraySize(g_m4_position_tickets);
+         ArrayResize(g_m4_position_tickets, count + 1);
+         g_m4_position_tickets[count] = (ulong)OrderTicket();
+      }
+      else if(M4IsPendingOrderType(OrderType()))
+      {
+         count = ArraySize(g_m4_pending_tickets);
+         ArrayResize(g_m4_pending_tickets, count + 1);
+         g_m4_pending_tickets[count] = (ulong)OrderTicket();
+      }
+   }
+   g_m4_trade_cache_tick_ms = now_tick_ms;
+}
+
+int M4PositionsTotal()
+{
+   M4RefreshTradeCache();
+   return ArraySize(g_m4_position_tickets);
+}
+
+ulong M4PositionGetTicket(const int position_index)
+{
+   M4RefreshTradeCache();
+   if(position_index < 0 || position_index >= ArraySize(g_m4_position_tickets))
+      return 0;
+   return g_m4_position_tickets[position_index];
+}
+
+bool M4PositionSelectByTicket(const ulong ticket)
+{
+   if(ticket == 0 || ticket > 2147483647)
+      return false;
+   return OrderSelect((int)ticket, SELECT_BY_TICKET, MODE_TRADES) &&
+          OrderCloseTime() == 0 &&
+          M4IsMarketOrderType(OrderType());
+}
+
+long M4PositionGetInteger(const int property_id)
+{
+   if(property_id == M4_POSITION_IDENTIFIER || property_id == M4_POSITION_TICKET)
+      return (long)OrderTicket();
+   if(property_id == M4_POSITION_MAGIC)
+      return (long)OrderMagicNumber();
+   if(property_id == M4_POSITION_TIME)
+      return (long)OrderOpenTime();
+   if(property_id == M4_POSITION_TYPE)
+      return OrderType() == OP_BUY ? M4_POSITION_TYPE_BUY : M4_POSITION_TYPE_SELL;
+   return 0;
+}
+
+double M4PositionGetDouble(const int property_id)
+{
+   if(property_id == M4_POSITION_PRICE_OPEN)
+      return OrderOpenPrice();
+   if(property_id == M4_POSITION_PROFIT)
+      return OrderProfit();
+   if(property_id == M4_POSITION_SL)
+      return OrderStopLoss();
+   if(property_id == M4_POSITION_SWAP)
+      return OrderSwap();
+   if(property_id == M4_POSITION_TP)
+      return OrderTakeProfit();
+   if(property_id == M4_POSITION_VOLUME)
+      return OrderLots();
+   return 0.0;
+}
+
+string M4PositionGetString(const int property_id)
+{
+   if(property_id == M4_POSITION_COMMENT)
+      return OrderComment();
+   if(property_id == M4_POSITION_SYMBOL)
+      return OrderSymbol();
+   return "";
+}
+
+int M4PendingOrdersTotal()
+{
+   M4RefreshTradeCache();
+   return ArraySize(g_m4_pending_tickets);
+}
+
+ulong M4PendingOrderGetTicket(const int pending_index)
+{
+   M4RefreshTradeCache();
+   if(pending_index < 0 || pending_index >= ArraySize(g_m4_pending_tickets))
+      return 0;
+   return g_m4_pending_tickets[pending_index];
+}
+
+bool M4PendingOrderSelectByTicket(const ulong ticket)
+{
+   if(ticket == 0 || ticket > 2147483647)
+      return false;
+   return OrderSelect((int)ticket, SELECT_BY_TICKET, MODE_TRADES) &&
+          OrderCloseTime() == 0 &&
+          M4IsPendingOrderType(OrderType());
+}
+
+long M4PendingOrderGetInteger(const int property_id)
+{
+   if(property_id == M4_ORDER_MAGIC)
+      return (long)OrderMagicNumber();
+   return 0;
+}
+
+string M4PendingOrderGetString(const int property_id)
+{
+   if(property_id == M4_ORDER_COMMENT)
+      return OrderComment();
+   return "";
+}
 
 uint WinApiMemoryCrc32(const uchar &data[], const int size)
 {
@@ -357,7 +535,7 @@ string WinApiMemoryErrorDescription(const int error_code)
 }
 
 bool WinApiMemoryAcquireGuard(const string object_name,
-                              long &guard_handle,
+                              int &guard_handle,
                               bool &guard_owned,
                               const int create_error,
                               const int busy_error,
@@ -403,51 +581,83 @@ void WinApiMemoryUnlock()
       ReleaseMutex(g_winapi_mutex_handle);
 }
 
-bool WinApiReadBytes(const long address, uchar &buffer[], const int size)
+bool WinApiReadBytes(const int address, uchar &buffer[], const int size)
 {
    if(address == 0 || size <= 0)
       return false;
 
    if(ArraySize(buffer) < size)
       ArrayResize(buffer, size);
-   ulong bytes_read = 0;
+   uint bytes_read = 0;
    int ok = ReadProcessMemory(g_winapi_process_handle,
                               address,
                               buffer,
-                              (ulong)size,
+                              (uint)size,
                               bytes_read);
-   return ok != 0 && bytes_read == (ulong)size;
+   return ok != 0 && bytes_read == (uint)size;
 }
 
-bool WinApiWriteBytes(const long address, uchar &buffer[], const int size)
+bool WinApiWriteBytes(const int address, uchar &buffer[], const int size)
 {
    if(address == 0 || size <= 0 || ArraySize(buffer) < size)
       return false;
 
-   ulong bytes_written = 0;
+   uint bytes_written = 0;
    int ok = WriteProcessMemory(g_winapi_process_handle,
                                address,
                                buffer,
-                               (ulong)size,
+                               (uint)size,
                                bytes_written);
-   return ok != 0 && bytes_written == (ulong)size;
+   return ok != 0 && bytes_written == (uint)size;
+}
+
+void WinApiHeaderPutLong(uchar &bytes[], const int offset, const long value)
+{
+   ulong raw = (ulong)value;
+   for(int i = 0; i < 8; i++)
+      bytes[offset + i] = (uchar)((raw >> (i * 8)) & 0xFF);
+}
+
+long WinApiHeaderGetLong(const uchar &bytes[], const int offset)
+{
+   ulong raw = 0;
+   for(int i = 0; i < 8; i++)
+      raw |= ((ulong)bytes[offset + i]) << (i * 8);
+   return (long)raw;
 }
 
 bool WinApiReadHeader(WinApiMemoryHeader &header)
 {
    uchar bytes[];
-   int header_size = sizeof(WinApiMemoryHeader);
-   if(!WinApiReadBytes(g_winapi_view_address, bytes, header_size))
+   if(!WinApiReadBytes(g_winapi_view_address, bytes, WINAPI_MEMORY_HEADER_SIZE))
       return false;
-   return CharArrayToStruct(header, bytes, 0);
+
+   header.magic = WinApiHeaderGetLong(bytes, 0);
+   header.version = WinApiHeaderGetLong(bytes, 8);
+   header.sequence = WinApiHeaderGetLong(bytes, 16);
+   header.publish_tick_ms = WinApiHeaderGetLong(bytes, 24);
+   header.payload_size = WinApiHeaderGetLong(bytes, 32);
+   header.payload_crc32 = WinApiHeaderGetLong(bytes, 40);
+   header.capacity_bytes = WinApiHeaderGetLong(bytes, 48);
+   header.reserved = WinApiHeaderGetLong(bytes, 56);
+   return true;
 }
 
 bool WinApiWriteHeader(WinApiMemoryHeader &header)
 {
    uchar bytes[];
-   if(!StructToCharArray(header, bytes, 0))
+   if(ArrayResize(bytes, WINAPI_MEMORY_HEADER_SIZE) != WINAPI_MEMORY_HEADER_SIZE)
       return false;
-   return WinApiWriteBytes(g_winapi_view_address, bytes, ArraySize(bytes));
+
+   WinApiHeaderPutLong(bytes, 0, header.magic);
+   WinApiHeaderPutLong(bytes, 8, header.version);
+   WinApiHeaderPutLong(bytes, 16, header.sequence);
+   WinApiHeaderPutLong(bytes, 24, header.publish_tick_ms);
+   WinApiHeaderPutLong(bytes, 32, header.payload_size);
+   WinApiHeaderPutLong(bytes, 40, header.payload_crc32);
+   WinApiHeaderPutLong(bytes, 48, header.capacity_bytes);
+   WinApiHeaderPutLong(bytes, 56, header.reserved);
+   return WinApiWriteBytes(g_winapi_view_address, bytes, WINAPI_MEMORY_HEADER_SIZE);
 }
 
 bool WinApiMemoryOpen()
@@ -457,9 +667,9 @@ bool WinApiMemoryOpen()
    g_winapi_last_read_sequence = 0;
    g_winapi_process_handle = GetCurrentProcess();
 
-   int header_size = sizeof(WinApiMemoryHeader);
-   int total_size = header_size + g_memory_capacity_bytes;
+   int total_size = WINAPI_MEMORY_HEADER_SIZE + g_memory_capacity_bytes;
    string object_part = WinApiMemoryObjectPart();
+   // Keep the original object namespace verbatim so MT4 and MT5 meet on the same channel.
    string mapping_name = "Local\\MQL5_WMLF_MAP_" + object_part;
    string mutex_name = "Local\\MQL5_WMLF_MUTEX_" + object_part;
    string writer_guard_name = "Local\\MQL5_WMLF_WRITER_" + object_part;
@@ -495,7 +705,7 @@ bool WinApiMemoryOpen()
       }
    }
 
-   g_winapi_mapping_handle = CreateFileMappingW((long)-1,
+   g_winapi_mapping_handle = CreateFileMappingW(-1,
                                                  0,
                                                  WINAPI_PAGE_READWRITE,
                                                  0,
@@ -512,7 +722,7 @@ bool WinApiMemoryOpen()
                                          WINAPI_FILE_MAP_ALL_ACCESS,
                                          0,
                                          0,
-                                         (ulong)total_size);
+                                         (uint)total_size);
    if(g_winapi_view_address == 0)
    {
       g_winapi_last_error = -102;
@@ -633,7 +843,7 @@ int WinApiMemoryWrite(uchar &payload[], const int payload_size)
       return -3;
    }
 
-   long payload_address = g_winapi_view_address + sizeof(WinApiMemoryHeader);
+   int payload_address = g_winapi_view_address + WINAPI_MEMORY_HEADER_SIZE;
    if(!WinApiWriteBytes(payload_address, payload, payload_size))
    {
       WinApiMemoryUnlock();
@@ -700,7 +910,7 @@ int WinApiMemoryRead(uchar &payload[], const int payload_capacity)
       return -4;
    }
 
-   long payload_address = g_winapi_view_address + sizeof(WinApiMemoryHeader);
+   int payload_address = g_winapi_view_address + WINAPI_MEMORY_HEADER_SIZE;
    if(!WinApiReadBytes(payload_address, payload, payload_size))
    {
       WinApiMemoryUnlock();
@@ -958,15 +1168,15 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
 
 int OnInit()
 {
-   if(!_IsX64)
-   {
-      Print("WinApiMemoryLossFollow requires 64-bit MetaTrader 5.");
-      return INIT_FAILED;
-   }
-
    if(InpChannelName == "")
    {
       Print("InpChannelName cannot be empty.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   if(InpCopyMagic > 2147483647)
+   {
+      Print("MT4 InpCopyMagic must be in 0..2147483647.");
       return INIT_PARAMETERS_INCORRECT;
    }
 
@@ -974,12 +1184,6 @@ int OnInit()
    {
       Print("InpSharedMemoryCapacityKB must be in 64..16384.");
       return INIT_PARAMETERS_INCORRECT;
-   }
-
-   if(sizeof(WinApiMemoryHeader) != WINAPI_MEMORY_HEADER_SIZE)
-   {
-      Print("Unexpected WinAPI memory header layout.");
-      return INIT_FAILED;
    }
 
    if(InpMemoryRole == MEMORY_FOLLOW_SENDER)
@@ -1001,7 +1205,7 @@ int InitMemorySender()
 
    int timer_period = InpSenderPublishIntervalMs < 10 ? 10 : InpSenderPublishIntervalMs;
    ResetLastError();
-   if(!EventSetMillisecondTimer((uint)timer_period))
+   if(!EventSetMillisecondTimer(timer_period))
    {
       PrintFormat("Start sender millisecond timer failed. period=%d error=%d",
                   timer_period,
@@ -1060,13 +1264,9 @@ int InitMemoryReceiver()
               IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               SanitizeNamePart(InpChannelName) + "_";
 
-   ENUM_ACCOUNT_MARGIN_MODE margin_mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
-   if(margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
-      Print("Warning: this EA is designed for hedging accounts. On netting accounts, source and copy positions may merge.");
-
    int timer_period = InpScanIntervalMs < 10 ? 10 : InpScanIntervalMs;
    ResetLastError();
-   if(!EventSetMillisecondTimer((uint)timer_period))
+   if(!EventSetMillisecondTimer(timer_period))
    {
       PrintFormat("Start receiver millisecond timer failed. period=%d error=%d",
                   timer_period,
@@ -1112,25 +1312,6 @@ void OnChartEvent(const int id,
    PanelHandleChartEvent(id, sparam);
 }
 
-void OnTradeTransaction(const MqlTradeTransaction& trans,
-                        const MqlTradeRequest& request,
-                        const MqlTradeResult& result)
-{
-   if(InpMemoryRole == MEMORY_FOLLOW_SENDER)
-   {
-      SenderWriteSnapshot();
-      return;
-   }
-
-   if(InpCloseCopyWithSource && LoadMemorySnapshot(true))
-   {
-      CloseCopiesWithoutSource();
-      DeletePendingsWithoutSource();
-      ResetInactiveGridGroups();
-   }
-   PanelUpdate(true);
-}
-
 void SenderWriteSnapshot()
 {
    if(g_winapi_view_address == 0)
@@ -1163,29 +1344,29 @@ string SenderBuildSnapshotText(const ulong sequence,
                  "\t" + IntegerToString((long)publish_tick_ms) + "\n";
 
    int exported = 0;
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = 0; i < total; i++)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
+      ulong ticket = M4PositionGetTicket(i);
+      if(ticket == 0 || !M4PositionSelectByTicket(ticket))
          continue;
 
-      string symbol = PositionGetString(POSITION_SYMBOL);
+      string symbol = M4PositionGetString(M4_POSITION_SYMBOL);
       if(!IsAllowedSymbol(symbol, InpSenderAllowedSymbols))
          continue;
 
-      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      if(type != POSITION_TYPE_BUY && type != POSITION_TYPE_SELL)
+      ENUM_M4_POSITION_TYPE type = (ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE);
+      if(type != M4_POSITION_TYPE_BUY && type != M4_POSITION_TYPE_SELL)
          continue;
 
-      long position_magic = PositionGetInteger(POSITION_MAGIC);
-      string position_comment = PositionGetString(POSITION_COMMENT);
+      long position_magic = M4PositionGetInteger(M4_POSITION_MAGIC);
+      string position_comment = M4PositionGetString(M4_POSITION_COMMENT);
       if(InpSenderExcludeOwnCopies &&
          ((ulong)position_magic == InpCopyMagic ||
           StringFind(position_comment, "WMLFC:") == 0))
          continue;
 
-      long identifier = PositionGetInteger(POSITION_IDENTIFIER);
+      long identifier = M4PositionGetInteger(M4_POSITION_IDENTIFIER);
       ulong source_id = identifier > 0 ? (ulong)identifier : ticket;
       text += "P\t" + IntegerToString((long)source_id) +
               "\t" + IntegerToString((long)ticket) +
@@ -1193,11 +1374,11 @@ string SenderBuildSnapshotText(const ulong sequence,
               "\t" + IntegerToString((int)type) +
               "\t" + IntegerToString(position_magic) +
               "\t" + EscapeMemoryField(position_comment) +
-              "\t" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 8) +
-              "\t" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), 10) +
-              "\t" + DoubleToString(PositionGetDouble(POSITION_SL), 10) +
-              "\t" + DoubleToString(PositionGetDouble(POSITION_TP), 10) +
-              "\t" + IntegerToString(PositionGetInteger(POSITION_TIME)) + "\n";
+              "\t" + DoubleToString(M4PositionGetDouble(M4_POSITION_VOLUME), 8) +
+              "\t" + DoubleToString(M4PositionGetDouble(M4_POSITION_PRICE_OPEN), 10) +
+              "\t" + DoubleToString(M4PositionGetDouble(M4_POSITION_SL), 10) +
+              "\t" + DoubleToString(M4PositionGetDouble(M4_POSITION_TP), 10) +
+              "\t" + IntegerToString(M4PositionGetInteger(M4_POSITION_TIME)) + "\n";
       exported++;
    }
 
@@ -1309,7 +1490,7 @@ bool PanelRoleIsReceiver()
 
 string PanelTransportName()
 {
-   return "共享内存 / Windows API";
+   return "共享内存 / WinAPI (MT4)";
 }
 
 uint PanelChannelHash(const string value)
@@ -1509,28 +1690,28 @@ void PanelCollectCopyStats(int &position_count,
    total_volume = 0.0;
    floating_profit = 0.0;
 
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   for(int i = M4PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
+      ulong ticket = M4PositionGetTicket(i);
+      if(ticket == 0 || !M4PositionSelectByTicket(ticket))
          continue;
       if(!IsCopyPosition())
          continue;
 
       position_count++;
-      total_volume += PositionGetDouble(POSITION_VOLUME);
-      floating_profit += PositionGetDouble(POSITION_PROFIT) +
-                         PositionGetDouble(POSITION_SWAP);
+      total_volume += M4PositionGetDouble(M4_POSITION_VOLUME);
+      floating_profit += M4PositionGetDouble(M4_POSITION_PROFIT) +
+                         M4PositionGetDouble(M4_POSITION_SWAP);
    }
 
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   for(int i = M4PendingOrdersTotal() - 1; i >= 0; i--)
    {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket == 0 || !OrderSelect(ticket))
+      ulong ticket = M4PendingOrderGetTicket(i);
+      if(ticket == 0 || !M4PendingOrderSelectByTicket(ticket))
          continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) != InpCopyMagic)
          continue;
-      if(!IsCopyComment(OrderGetString(ORDER_COMMENT)))
+      if(!IsCopyComment(M4PendingOrderGetString(M4_ORDER_COMMENT)))
          continue;
       pending_count++;
    }
@@ -1645,10 +1826,10 @@ void PanelCloseAllCopies()
    int success = 0;
    int failed = 0;
 
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   for(int i = M4PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
       if(!IsCopyPosition())
          continue;
@@ -1672,15 +1853,15 @@ void PanelDeleteAllPendings()
    int success = 0;
    int failed = 0;
 
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   for(int i = M4PendingOrdersTotal() - 1; i >= 0; i--)
    {
-      ulong order_ticket = OrderGetTicket(i);
-      if(order_ticket == 0 || !OrderSelect(order_ticket))
+      ulong order_ticket = M4PendingOrderGetTicket(i);
+      if(order_ticket == 0 || !M4PendingOrderSelectByTicket(order_ticket))
          continue;
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) != InpCopyMagic)
          continue;
 
-      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      ulong source_ticket = SourceTicketFromComment(M4PendingOrderGetString(M4_ORDER_COMMENT));
       if(source_ticket == 0)
          continue;
       if(DeleteCopyPending(order_ticket, source_ticket))
@@ -1763,8 +1944,8 @@ void CheckPositions()
       if(profile.entry_mode == ENTRY_GRID_ACTIVATION)
          continue;
 
-      ENUM_POSITION_TYPE position_type = source.position_type;
-      if(position_type != POSITION_TYPE_BUY && position_type != POSITION_TYPE_SELL)
+      ENUM_M4_POSITION_TYPE position_type = source.position_type;
+      if(position_type != M4_POSITION_TYPE_BUY && position_type != M4_POSITION_TYPE_SELL)
          continue;
 
       ProcessSourceLevel(source, profile, 1);
@@ -1790,8 +1971,8 @@ void CheckGridActivationEntries()
       if(profile.entry_mode != ENTRY_GRID_ACTIVATION)
          continue;
 
-      ENUM_POSITION_TYPE position_type = source.position_type;
-      if(position_type != POSITION_TYPE_BUY && position_type != POSITION_TYPE_SELL)
+      ENUM_M4_POSITION_TYPE position_type = source.position_type;
+      if(position_type != M4_POSITION_TYPE_BUY && position_type != M4_POSITION_TYPE_SELL)
          continue;
 
       string key = BasketKey(profile.profile_index, symbol, position_type);
@@ -1805,7 +1986,7 @@ void CheckGridActivationEntries()
 
 void ProcessGridGroup(const SourceProfile& profile,
                       const string symbol,
-                      const ENUM_POSITION_TYPE position_type)
+                      const ENUM_M4_POSITION_TYPE position_type)
 {
    string local_symbol = LocalSymbolForSource(symbol);
    if(!EnsureSymbolReady(local_symbol))
@@ -1859,7 +2040,7 @@ void ProcessGridGroup(const SourceProfile& profile,
          PrintFormat("Grid activation triggered. profile=EA%d symbol=%s type=%s source_count=%d loss=%.1f points / %.5f price",
                      profile.profile_index,
                      symbol,
-                     position_type == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                     position_type == M4_POSITION_TYPE_BUY ? "BUY" : "SELL",
                      source_count,
                      loss_points,
                      loss_price);
@@ -1874,7 +2055,7 @@ void ProcessGridGroup(const SourceProfile& profile,
 
 bool SourceGroupStats(const SourceProfile& profile,
                       const string symbol,
-                      const ENUM_POSITION_TYPE position_type,
+                      const ENUM_M4_POSITION_TYPE position_type,
                       int& source_count,
                       double& total_volume,
                       double& weighted_open)
@@ -1926,7 +2107,7 @@ bool IsSourcePositionForProfile(const SourceProfile& profile, const MemorySource
 void CopyGridSources(const SourceProfile& profile,
                      const string symbol,
                      const string local_symbol,
-                     const ENUM_POSITION_TYPE position_type,
+                     const ENUM_M4_POSITION_TYPE position_type,
                      const bool initial_activation,
                      const double group_loss_points,
                      const double group_loss_price)
@@ -1988,24 +2169,24 @@ void CopyGridSources(const SourceProfile& profile,
 
 int CopyGroupCount(const int profile_index,
                    const string symbol,
-                   const ENUM_POSITION_TYPE position_type)
+                   const ENUM_M4_POSITION_TYPE position_type)
 {
    int copy_count = 0;
 
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
+      if(M4PositionGetString(M4_POSITION_SYMBOL) != symbol)
          continue;
 
-      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+      if((ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE) != position_type)
          continue;
 
       SourceProfile profile;
@@ -2015,7 +2196,7 @@ int CopyGroupCount(const int profile_index,
       if(profile.profile_index != profile_index)
          continue;
 
-      if(!PositionSelectByTicket(copy_ticket))
+      if(!M4PositionSelectByTicket(copy_ticket))
          continue;
 
       copy_count++;
@@ -2045,8 +2226,8 @@ void ProcessSourceLevel(const MemorySourcePosition& source, const SourceProfile&
       return;
    }
 
-   ENUM_POSITION_TYPE position_type = source.position_type;
-   if(position_type != POSITION_TYPE_BUY && position_type != POSITION_TYPE_SELL)
+   ENUM_M4_POSITION_TYPE position_type = source.position_type;
+   if(position_type != M4_POSITION_TYPE_BUY && position_type != M4_POSITION_TYPE_SELL)
       return;
 
    double source_open_price = source.open_price;
@@ -2363,11 +2544,11 @@ bool IsBeijingFirstEntryFilterTime()
 
 bool HasOpenCopyPositions()
 {
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(IsCopyPosition())
@@ -2424,28 +2605,28 @@ void ApplyFirstEntryTimeFilter()
    if(!IsFirstCopyEntryTimeBlocked())
       return;
 
-   int total = OrdersTotal();
+   int total = M4PendingOrdersTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong order_ticket = OrderGetTicket(i);
-      if(order_ticket == 0 || !OrderSelect(order_ticket))
+      ulong order_ticket = M4PendingOrderGetTicket(i);
+      if(order_ticket == 0 || !M4PendingOrderSelectByTicket(order_ticket))
          continue;
 
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) != InpCopyMagic)
          continue;
 
-      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      ulong source_ticket = SourceTicketFromComment(M4PendingOrderGetString(M4_ORDER_COMMENT));
       DeleteCopyPending(order_ticket, source_ticket);
    }
 }
 
 void CheckMinuteProfitClose()
 {
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
@@ -2465,15 +2646,15 @@ void CheckMinuteProfitClose()
       if(!ShouldCheckProfitClose(profile))
          continue;
 
-      if(!PositionSelectByTicket(copy_ticket))
+      if(!M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(IsCloseRetryCoolingDown(copy_ticket))
          continue;
 
-      double profit_points = FloatingProfitPoints(PositionGetString(POSITION_SYMBOL),
-                                                  (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE),
-                                                  PositionGetDouble(POSITION_PRICE_OPEN));
+      double profit_points = FloatingProfitPoints(M4PositionGetString(M4_POSITION_SYMBOL),
+                                                  (ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE),
+                                                  M4PositionGetDouble(M4_POSITION_PRICE_OPEN));
       if(profit_points < profile.minute_profit_close_points)
          continue;
 
@@ -2514,13 +2695,13 @@ bool ShouldCheckProfitClose(const SourceProfile& profile)
 
 void CheckBasketProfitClose()
 {
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    string processed_keys[];
 
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
@@ -2540,11 +2721,11 @@ void CheckBasketProfitClose()
       if(!ShouldCheckProfitClose(profile))
          continue;
 
-      if(!PositionSelectByTicket(copy_ticket))
+      if(!M4PositionSelectByTicket(copy_ticket))
          continue;
 
-      string symbol = PositionGetString(POSITION_SYMBOL);
-      ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      string symbol = M4PositionGetString(M4_POSITION_SYMBOL);
+      ENUM_M4_POSITION_TYPE position_type = (ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE);
       string key = BasketKey(profile.profile_index, symbol, position_type);
       if(IsStringInArray(processed_keys, key))
          continue;
@@ -2559,7 +2740,7 @@ void CheckBasketProfitClose()
          PrintFormat("Basket profit close triggered. profile=EA%d symbol=%s type=%s profit=%.1f points threshold=%.1f",
                      profile.profile_index,
                      symbol,
-                     position_type == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                     position_type == M4_POSITION_TYPE_BUY ? "BUY" : "SELL",
                      basket_points,
                      profile.basket_profit_close_points);
       }
@@ -2571,25 +2752,25 @@ void CheckBasketProfitClose()
    }
 }
 
-double BasketProfitPoints(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+double BasketProfitPoints(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    double total_volume = 0.0;
    double weighted_open = 0.0;
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
 
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
+      if(M4PositionGetString(M4_POSITION_SYMBOL) != symbol)
          continue;
 
-      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+      if((ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE) != position_type)
          continue;
 
       SourceProfile profile;
@@ -2599,12 +2780,12 @@ double BasketProfitPoints(const int profile_index, const string symbol, const EN
       if(profile.profile_index != profile_index)
          continue;
 
-      if(!PositionSelectByTicket(copy_ticket))
+      if(!M4PositionSelectByTicket(copy_ticket))
          continue;
 
-      double volume = PositionGetDouble(POSITION_VOLUME);
+      double volume = M4PositionGetDouble(M4_POSITION_VOLUME);
       total_volume += volume;
-      weighted_open += PositionGetDouble(POSITION_PRICE_OPEN) * volume;
+      weighted_open += M4PositionGetDouble(M4_POSITION_PRICE_OPEN) * volume;
    }
 
    if(total_volume <= 0.0)
@@ -2614,22 +2795,22 @@ double BasketProfitPoints(const int profile_index, const string symbol, const EN
    return FloatingProfitPoints(symbol, position_type, avg_open);
 }
 
-void CloseBasketPositions(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+void CloseBasketPositions(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
          continue;
 
-      if(PositionGetString(POSITION_SYMBOL) != symbol)
+      if(M4PositionGetString(M4_POSITION_SYMBOL) != symbol)
          continue;
 
-      if((ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE) != position_type)
+      if((ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE) != position_type)
          continue;
 
       ulong source_ticket = SourceTicketFromCurrentPosition();
@@ -2640,7 +2821,7 @@ void CloseBasketPositions(const int profile_index, const string symbol, const EN
       if(profile.profile_index != profile_index)
          continue;
 
-      if(!PositionSelectByTicket(copy_ticket))
+      if(!M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(IsCloseRetryCoolingDown(copy_ticket))
@@ -2662,7 +2843,7 @@ bool SourceProfileByTicket(const ulong source_ticket, SourceProfile& profile)
                              profile);
 }
 
-string BasketKey(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+string BasketKey(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    return IntegerToString(profile_index) + "|" + symbol + "|" + IntegerToString((int)position_type);
 }
@@ -2675,7 +2856,7 @@ string GridStatePrefix(const string state)
 string GridGroupStateName(const string state,
                           const int profile_index,
                           const string symbol,
-                          const ENUM_POSITION_TYPE position_type)
+                          const ENUM_M4_POSITION_TYPE position_type)
 {
    return GridStatePrefix(state) +
           IntegerToString(profile_index) + "_" +
@@ -2683,27 +2864,27 @@ string GridGroupStateName(const string state,
           symbol;
 }
 
-bool IsGridGroupActive(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+bool IsGridGroupActive(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    return GlobalVariableCheck(GridGroupStateName("A", profile_index, symbol, position_type));
 }
 
-bool IsGridGroupStopped(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+bool IsGridGroupStopped(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    return GlobalVariableCheck(GridGroupStateName("S", profile_index, symbol, position_type));
 }
 
-void SetGridGroupActive(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+void SetGridGroupActive(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    GlobalVariableSet(GridGroupStateName("A", profile_index, symbol, position_type), (double)TimeCurrent());
 }
 
-void ClearGridGroupActive(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+void ClearGridGroupActive(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    GlobalVariableDel(GridGroupStateName("A", profile_index, symbol, position_type));
 }
 
-void SetGridGroupStopped(const int profile_index, const string symbol, const ENUM_POSITION_TYPE position_type)
+void SetGridGroupStopped(const int profile_index, const string symbol, const ENUM_M4_POSITION_TYPE position_type)
 {
    GlobalVariableSet(GridGroupStateName("S", profile_index, symbol, position_type), (double)TimeCurrent());
 }
@@ -2711,7 +2892,7 @@ void SetGridGroupStopped(const int profile_index, const string symbol, const ENU
 bool ParseGridStateName(const string name,
                         int& profile_index,
                         string& symbol,
-                        ENUM_POSITION_TYPE& position_type)
+                        ENUM_M4_POSITION_TYPE& position_type)
 {
    string active_prefix = GridStatePrefix("A");
    string stopped_prefix = GridStatePrefix("S");
@@ -2731,7 +2912,7 @@ bool ParseGridStateName(const string name,
       return false;
 
    profile_index = (int)StringToInteger(parts[0]);
-   position_type = (ENUM_POSITION_TYPE)StringToInteger(parts[1]);
+   position_type = (ENUM_M4_POSITION_TYPE)StringToInteger(parts[1]);
    symbol = parts[2];
    for(int i = 3; i < count; i++)
       symbol += "_" + parts[i];
@@ -2747,7 +2928,7 @@ void ResetInactiveGridGroups()
       string name = GlobalVariableName(i);
       int profile_index = 0;
       string symbol = "";
-      ENUM_POSITION_TYPE position_type = POSITION_TYPE_BUY;
+      ENUM_M4_POSITION_TYPE position_type = M4_POSITION_TYPE_BUY;
       if(!ParseGridStateName(name, profile_index, symbol, position_type))
          continue;
 
@@ -2793,11 +2974,11 @@ void AddString(string &values[], const string value)
 
 void CloseCopiesWithoutSource()
 {
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong copy_ticket = PositionGetTicket(i);
-      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+      ulong copy_ticket = M4PositionGetTicket(i);
+      if(copy_ticket == 0 || !M4PositionSelectByTicket(copy_ticket))
          continue;
 
       if(!IsCopyPosition())
@@ -2819,17 +3000,17 @@ void CloseCopiesWithoutSource()
 
 void DeletePendingsWithoutSource()
 {
-   int total = OrdersTotal();
+   int total = M4PendingOrdersTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong order_ticket = OrderGetTicket(i);
-      if(order_ticket == 0 || !OrderSelect(order_ticket))
+      ulong order_ticket = M4PendingOrderGetTicket(i);
+      if(order_ticket == 0 || !M4PendingOrderSelectByTicket(order_ticket))
          continue;
 
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) != InpCopyMagic)
          continue;
 
-      ulong source_ticket = SourceTicketFromComment(OrderGetString(ORDER_COMMENT));
+      ulong source_ticket = SourceTicketFromComment(M4PendingOrderGetString(M4_ORDER_COMMENT));
       if(source_ticket == 0)
          continue;
 
@@ -2881,11 +3062,11 @@ bool IsCopyComment(const string comment)
 
 ulong CurrentPositionIdentifier()
 {
-   long identifier = PositionGetInteger(POSITION_IDENTIFIER);
+   long identifier = M4PositionGetInteger(M4_POSITION_IDENTIFIER);
    if(identifier > 0)
       return (ulong)identifier;
 
-   return (ulong)PositionGetInteger(POSITION_TICKET);
+   return (ulong)M4PositionGetInteger(M4_POSITION_TICKET);
 }
 
 string CopyPositionSourceMapName(const ulong position_identifier)
@@ -2914,7 +3095,7 @@ void RememberCopyPositionMapping(const ulong source_ticket, const int level_inde
 
 ulong SourceTicketFromCurrentPosition()
 {
-   string comment = PositionGetString(POSITION_COMMENT);
+   string comment = M4PositionGetString(M4_POSITION_COMMENT);
    ulong source_ticket = SourceTicketFromComment(comment);
    if(source_ticket != 0)
    {
@@ -2935,7 +3116,7 @@ ulong SourceTicketFromCurrentPosition()
 
 int CopyLevelFromCurrentPosition()
 {
-   string comment = PositionGetString(POSITION_COMMENT);
+   string comment = M4PositionGetString(M4_POSITION_COMMENT);
    int level_index = CopyLevelFromComment(comment);
    if(level_index > 0)
       return level_index;
@@ -2958,7 +3139,7 @@ bool IsCopyPosition()
 
    // 手动部分平仓后，部分券商/终端可能让剩余仓位的magic或注释变化。
    // 有本地映射且magic为0时也按本EA跟单仓处理；其他非0 magic不接管。
-   long magic = PositionGetInteger(POSITION_MAGIC);
+   long magic = M4PositionGetInteger(M4_POSITION_MAGIC);
    return (ulong)magic == InpCopyMagic || magic == 0;
 }
 
@@ -3006,7 +3187,7 @@ bool EnsureSymbolReady(const string symbol)
    return point > 0.0 && min_volume > 0.0 && max_volume > 0.0 && step > 0.0;
 }
 
-double FloatingLossPoints(const string symbol, const ENUM_POSITION_TYPE position_type, const double open_price)
+double FloatingLossPoints(const string symbol, const ENUM_M4_POSITION_TYPE position_type, const double open_price)
 {
    if(!EnsureSymbolReady(symbol))
       return 0.0;
@@ -3018,13 +3199,13 @@ double FloatingLossPoints(const string symbol, const ENUM_POSITION_TYPE position
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
 
-   if(position_type == POSITION_TYPE_BUY)
+   if(position_type == M4_POSITION_TYPE_BUY)
       return MathMax(0.0, (open_price - bid) / point);
 
    return MathMax(0.0, (ask - open_price) / point);
 }
 
-double FloatingProfitPoints(const string symbol, const ENUM_POSITION_TYPE position_type, const double open_price)
+double FloatingProfitPoints(const string symbol, const ENUM_M4_POSITION_TYPE position_type, const double open_price)
 {
    if(!EnsureSymbolReady(symbol))
       return 0.0;
@@ -3036,7 +3217,7 @@ double FloatingProfitPoints(const string symbol, const ENUM_POSITION_TYPE positi
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
 
-   if(position_type == POSITION_TYPE_BUY)
+   if(position_type == M4_POSITION_TYPE_BUY)
       return MathMax(0.0, (bid - open_price) / point);
 
    return MathMax(0.0, (open_price - ask) / point);
@@ -3086,7 +3267,7 @@ int VolumeDigits(double step)
 
 bool PlaceCopyPending(const ulong source_ticket,
                       const string symbol,
-                      const ENUM_POSITION_TYPE position_type,
+                      const ENUM_M4_POSITION_TYPE position_type,
                       const double source_open_price,
                       const double volume,
                       const double source_sl,
@@ -3100,7 +3281,7 @@ bool PlaceCopyPending(const ulong source_ticket,
    if(trigger_distance <= 0.0 || point <= 0.0)
       return false;
 
-   double trigger_price = position_type == POSITION_TYPE_BUY
+   double trigger_price = position_type == M4_POSITION_TYPE_BUY
                           ? source_open_price - trigger_distance
                           : source_open_price + trigger_distance;
    trigger_price = NormalizeDouble(trigger_price, digits);
@@ -3108,8 +3289,8 @@ bool PlaceCopyPending(const ulong source_ticket,
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
 
-   if((position_type == POSITION_TYPE_BUY && trigger_price >= ask) ||
-      (position_type == POSITION_TYPE_SELL && trigger_price <= bid))
+   if((position_type == M4_POSITION_TYPE_BUY && trigger_price >= ask) ||
+      (position_type == M4_POSITION_TYPE_SELL && trigger_price <= bid))
    {
       double loss_points = FloatingLossPoints(symbol, position_type, source_open_price);
       double loss_price = loss_points * point;
@@ -3118,41 +3299,50 @@ bool PlaceCopyPending(const ulong source_ticket,
       return true;
    }
 
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
+   double stop_loss = 0.0;
+   double take_profit = 0.0;
+   CalculateStops(stop_loss,
+                  take_profit,
+                  position_type,
+                  trigger_price,
+                  source_sl,
+                  source_tp,
+                  point,
+                  digits,
+                  profile,
+                  level_index);
 
-   request.action = TRADE_ACTION_PENDING;
-   request.symbol = symbol;
-   request.volume = volume;
-   request.type = position_type == POSITION_TYPE_BUY ? ORDER_TYPE_BUY_LIMIT : ORDER_TYPE_SELL_LIMIT;
-   request.price = trigger_price;
-   request.deviation = InpDeviationPoints;
-   request.magic = InpCopyMagic;
-   request.comment = CopyComment(source_ticket, level_index);
-   request.type_time = ORDER_TIME_GTC;
-   request.type_filling = GetFillingType(symbol);
-
-   ApplyStops(request, position_type, trigger_price, source_sl, source_tp, point, digits, profile, level_index);
+   int command = position_type == M4_POSITION_TYPE_BUY ? OP_BUYLIMIT : OP_SELLLIMIT;
 
    ResetLastError();
-   bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   int order_ticket = OrderSend(symbol,
+                                command,
+                                volume,
+                                trigger_price,
+                                InpDeviationPoints,
+                                stop_loss,
+                                take_profit,
+                                CopyComment(source_ticket, level_index),
+                                (int)InpCopyMagic,
+                                0,
+                                clrNONE);
+   if(order_ticket < 0)
    {
-      PrintFormat("Pending copy failed. source=%I64u symbol=%s volume=%.8f price=%.5f retcode=%u last_error=%d comment=%s",
-                  source_ticket, symbol, volume, trigger_price, result.retcode, GetLastError(), result.comment);
+      int error_code = GetLastError();
+      PrintFormat("MT4 pending copy failed. source=%I64u symbol=%s volume=%.8f price=%.5f error=%d",
+                  source_ticket, symbol, volume, trigger_price, error_code);
       return false;
    }
+   M4InvalidateTradeCache();
 
    if(InpPrintDebug)
    {
       PrintFormat("Pending copy placed. source=%I64u level=L%d order=%I64u symbol=%s type=%s volume=%.8f source_open=%.5f distance=%.5f trigger=%.5f",
                   source_ticket,
                   level_index,
-                  result.order,
+                  (ulong)order_ticket,
                   symbol,
-                  position_type == POSITION_TYPE_BUY ? "BUY_LIMIT" : "SELL_LIMIT",
+                  position_type == M4_POSITION_TYPE_BUY ? "BUY_LIMIT" : "SELL_LIMIT",
                   volume,
                   source_open_price,
                   trigger_distance,
@@ -3170,20 +3360,23 @@ double TriggerDistancePrice(const string symbol, const SourceProfile& profile, c
    return LevelLossPoints(profile, level_index) * SymbolInfoDouble(symbol, SYMBOL_POINT);
 }
 
-void ApplyStops(MqlTradeRequest& request,
-                const ENUM_POSITION_TYPE position_type,
-                const double entry_price,
-                const double source_sl,
-                const double source_tp,
-                const double point,
-                const int digits,
-                const SourceProfile& profile,
-                const int level_index)
+void CalculateStops(double &stop_loss,
+                    double &take_profit,
+                    const ENUM_M4_POSITION_TYPE position_type,
+                    const double entry_price,
+                    const double source_sl,
+                    const double source_tp,
+                    const double point,
+                    const int digits,
+                    const SourceProfile& profile,
+                    const int level_index)
 {
+   stop_loss = 0.0;
+   take_profit = 0.0;
    if(profile.copy_source_sltp)
    {
-      request.sl = source_sl > 0.0 ? NormalizeDouble(source_sl, digits) : 0.0;
-      request.tp = source_tp > 0.0 ? NormalizeDouble(source_tp, digits) : 0.0;
+      stop_loss = source_sl > 0.0 ? NormalizeDouble(source_sl, digits) : 0.0;
+      take_profit = source_tp > 0.0 ? NormalizeDouble(source_tp, digits) : 0.0;
       return;
    }
 
@@ -3192,24 +3385,24 @@ void ApplyStops(MqlTradeRequest& request,
 
    if(stop_loss_points > 0.0)
    {
-      double sl = position_type == POSITION_TYPE_BUY
+      double sl = position_type == M4_POSITION_TYPE_BUY
                   ? entry_price - stop_loss_points * point
                   : entry_price + stop_loss_points * point;
-      request.sl = NormalizeDouble(sl, digits);
+      stop_loss = NormalizeDouble(sl, digits);
    }
 
    if(take_profit_points > 0.0)
    {
-      double tp = position_type == POSITION_TYPE_BUY
+      double tp = position_type == M4_POSITION_TYPE_BUY
                   ? entry_price + take_profit_points * point
                   : entry_price - take_profit_points * point;
-      request.tp = NormalizeDouble(tp, digits);
+      take_profit = NormalizeDouble(tp, digits);
    }
 }
 
 bool OpenCopyTrade(const ulong source_ticket,
                    const string symbol,
-                   const ENUM_POSITION_TYPE position_type,
+                   const ENUM_M4_POSITION_TYPE position_type,
                    const double volume,
                    const double source_sl,
                    const double source_tp,
@@ -3218,48 +3411,58 @@ bool OpenCopyTrade(const ulong source_ticket,
                    const SourceProfile& profile,
                    const int level_index)
 {
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
-
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double price = position_type == POSITION_TYPE_BUY ? ask : bid;
+   double price = position_type == M4_POSITION_TYPE_BUY ? ask : bid;
 
-   request.action = TRADE_ACTION_DEAL;
-   request.symbol = symbol;
-   request.volume = volume;
-   request.type = position_type == POSITION_TYPE_BUY ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
-   request.price = NormalizeDouble(price, digits);
-   request.deviation = InpDeviationPoints;
-   request.magic = InpCopyMagic;
-   request.comment = CopyComment(source_ticket, level_index);
-   request.type_time = ORDER_TIME_GTC;
-   request.type_filling = GetFillingType(symbol);
+   price = NormalizeDouble(price, digits);
+   double stop_loss = 0.0;
+   double take_profit = 0.0;
+   CalculateStops(stop_loss,
+                  take_profit,
+                  position_type,
+                  price,
+                  source_sl,
+                  source_tp,
+                  point,
+                  digits,
+                  profile,
+                  level_index);
 
-   ApplyStops(request, position_type, request.price, source_sl, source_tp, point, digits, profile, level_index);
+   int command = position_type == M4_POSITION_TYPE_BUY ? OP_BUY : OP_SELL;
 
    ResetLastError();
-   bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   int order_ticket = OrderSend(symbol,
+                                command,
+                                volume,
+                                price,
+                                InpDeviationPoints,
+                                stop_loss,
+                                take_profit,
+                                CopyComment(source_ticket, level_index),
+                                (int)InpCopyMagic,
+                                0,
+                                clrNONE);
+   if(order_ticket < 0)
    {
-      PrintFormat("Copy failed. source=%I64u symbol=%s volume=%.8f retcode=%u last_error=%d comment=%s",
-                  source_ticket, symbol, volume, result.retcode, GetLastError(), result.comment);
+      int error_code = GetLastError();
+      PrintFormat("MT4 copy failed. source=%I64u symbol=%s volume=%.8f error=%d",
+                  source_ticket, symbol, volume, error_code);
       return false;
    }
+   M4InvalidateTradeCache();
 
    if(InpPrintDebug)
    {
       PrintFormat("Copy opened. source=%I64u level=L%d order=%I64u deal=%I64u symbol=%s type=%s volume=%.8f source_loss=%.1f points / %.5f price",
                   source_ticket,
                   level_index,
-                  result.order,
-                  result.deal,
+                  (ulong)order_ticket,
+                  (ulong)order_ticket,
                   symbol,
-                  position_type == POSITION_TYPE_BUY ? "BUY" : "SELL",
+                  position_type == M4_POSITION_TYPE_BUY ? "BUY" : "SELL",
                   volume,
                   loss_points,
                   loss_price);
@@ -3270,24 +3473,18 @@ bool OpenCopyTrade(const ulong source_ticket,
 
 bool DeleteCopyPending(const ulong order_ticket, const ulong source_ticket)
 {
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
-
-   request.action = TRADE_ACTION_REMOVE;
-   request.order = order_ticket;
-   request.magic = InpCopyMagic;
-   request.comment = "WMLFC remove:" + IntegerToString((long)source_ticket);
+   if(order_ticket == 0 || order_ticket > 2147483647)
+      return false;
 
    ResetLastError();
-   bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(!OrderDelete((int)order_ticket, clrNONE))
    {
-      PrintFormat("Delete pending failed. order=%I64u source=%I64u retcode=%u last_error=%d comment=%s",
-                  order_ticket, source_ticket, result.retcode, GetLastError(), result.comment);
+      int error_code = GetLastError();
+      PrintFormat("MT4 delete pending failed. order=%I64u source=%I64u error=%d",
+                  order_ticket, source_ticket, error_code);
       return false;
    }
+   M4InvalidateTradeCache();
 
    if(InpPrintDebug)
       PrintFormat("Pending copy deleted. order=%I64u source=%I64u", order_ticket, source_ticket);
@@ -3297,49 +3494,36 @@ bool DeleteCopyPending(const ulong order_ticket, const ulong source_ticket)
 
 bool CloseCopyPosition(const ulong copy_ticket, const ulong source_ticket)
 {
-   if(!PositionSelectByTicket(copy_ticket))
+   if(!M4PositionSelectByTicket(copy_ticket))
       return false;
 
-   string symbol = PositionGetString(POSITION_SYMBOL);
-   ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-   double volume = PositionGetDouble(POSITION_VOLUME);
+   string symbol = M4PositionGetString(M4_POSITION_SYMBOL);
+   ENUM_M4_POSITION_TYPE position_type = (ENUM_M4_POSITION_TYPE)M4PositionGetInteger(M4_POSITION_TYPE);
+   double volume = M4PositionGetDouble(M4_POSITION_VOLUME);
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
-   double price = position_type == POSITION_TYPE_BUY ? bid : ask;
+   double price = position_type == M4_POSITION_TYPE_BUY ? bid : ask;
 
-   MqlTradeRequest request;
-   MqlTradeResult result;
-   ZeroMemory(request);
-   ZeroMemory(result);
-
-   request.action = TRADE_ACTION_DEAL;
-   request.position = copy_ticket;
-   request.symbol = symbol;
-   request.volume = volume;
-   request.type = position_type == POSITION_TYPE_BUY ? ORDER_TYPE_SELL : ORDER_TYPE_BUY;
-   request.price = NormalizeDouble(price, digits);
-   request.deviation = InpDeviationPoints;
-   request.magic = InpCopyMagic;
-   request.comment = "WMLFC close:" + IntegerToString((long)source_ticket);
-   request.type_time = ORDER_TIME_GTC;
-   request.type_filling = GetFillingType(symbol);
+   price = NormalizeDouble(price, digits);
 
    MarkCloseAttempt(copy_ticket);
    ResetLastError();
-   bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(copy_ticket > 2147483647 ||
+      !OrderClose((int)copy_ticket, volume, price, InpDeviationPoints, clrNONE))
    {
-      PrintFormat("Close copy failed. copy=%I64u source=%I64u symbol=%s volume=%.8f retcode=%u last_error=%d comment=%s",
-                  copy_ticket, source_ticket, symbol, volume, result.retcode, GetLastError(), result.comment);
+      int error_code = GetLastError();
+      PrintFormat("MT4 close copy failed. copy=%I64u source=%I64u symbol=%s volume=%.8f error=%d",
+                  copy_ticket, source_ticket, symbol, volume, error_code);
       return false;
    }
+   M4InvalidateTradeCache();
 
    if(InpPrintDebug)
    {
-      PrintFormat("Copy closed with source. copy=%I64u source=%I64u order=%I64u deal=%I64u symbol=%s volume=%.8f",
-                  copy_ticket, source_ticket, result.order, result.deal, symbol, volume);
+      PrintFormat("Copy closed with source. copy=%I64u source=%I64u symbol=%s volume=%.8f",
+                  copy_ticket, source_ticket, symbol, volume);
    }
 
    return true;
@@ -3363,26 +3547,6 @@ void MarkCloseAttempt(const ulong copy_ticket)
 string CloseAttemptGlobalName(const ulong copy_ticket)
 {
    return g_prefix + "CLOSING_" + IntegerToString((long)InpCopyMagic) + "_" + IntegerToString((long)copy_ticket);
-}
-
-ENUM_ORDER_TYPE_FILLING GetFillingType(const string symbol)
-{
-   int filling = (int)SymbolInfoInteger(symbol, SYMBOL_FILLING_MODE);
-
-   if((filling & SYMBOL_FILLING_FOK) == SYMBOL_FILLING_FOK)
-      return ORDER_FILLING_FOK;
-
-   if((filling & SYMBOL_FILLING_IOC) == SYMBOL_FILLING_IOC)
-      return ORDER_FILLING_IOC;
-
-   return ORDER_FILLING_RETURN;
-}
-
-bool IsSuccessRetcode(const uint retcode)
-{
-   return retcode == TRADE_RETCODE_DONE ||
-          retcode == TRADE_RETCODE_DONE_PARTIAL ||
-          retcode == TRADE_RETCODE_PLACED;
 }
 
 bool IsAllowedSymbol(string symbol, string allowed)
@@ -3422,17 +3586,17 @@ bool IsAlreadyCopied(const ulong source_ticket, const int level_index)
 
    string expected_comment = CopyComment(source_ticket, level_index);
    string legacy_comment = "WMLFC:" + IntegerToString((long)source_ticket);
-   int total = PositionsTotal();
+   int total = M4PositionsTotal();
    for(int i = total - 1; i >= 0; i--)
    {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || !PositionSelectByTicket(ticket))
+      ulong ticket = M4PositionGetTicket(i);
+      if(ticket == 0 || !M4PositionSelectByTicket(ticket))
          continue;
 
       if(!IsCopyPosition())
          continue;
 
-      string comment = PositionGetString(POSITION_COMMENT);
+      string comment = M4PositionGetString(M4_POSITION_COMMENT);
       if(comment == expected_comment || (level_index == 1 && comment == legacy_comment))
          return true;
 
@@ -3440,17 +3604,17 @@ bool IsAlreadyCopied(const ulong source_ticket, const int level_index)
          return true;
    }
 
-   int orders_total = OrdersTotal();
+   int orders_total = M4PendingOrdersTotal();
    for(int i = orders_total - 1; i >= 0; i--)
    {
-      ulong order_ticket = OrderGetTicket(i);
-      if(order_ticket == 0 || !OrderSelect(order_ticket))
+      ulong order_ticket = M4PendingOrderGetTicket(i);
+      if(order_ticket == 0 || !M4PendingOrderSelectByTicket(order_ticket))
          continue;
 
-      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) != InpCopyMagic)
          continue;
 
-      string comment = OrderGetString(ORDER_COMMENT);
+      string comment = M4PendingOrderGetString(M4_ORDER_COMMENT);
       if(comment == expected_comment || (level_index == 1 && comment == legacy_comment))
          return true;
    }
@@ -3620,7 +3784,7 @@ bool ParseMemorySnapshot(const string payload,
          source.source_id = (ulong)StringToInteger(fields[1]);
          source.ticket = (ulong)StringToInteger(fields[2]);
          source.symbol = UnescapeMemoryField(fields[3]);
-         source.position_type = (ENUM_POSITION_TYPE)StringToInteger(fields[4]);
+         source.position_type = (ENUM_M4_POSITION_TYPE)StringToInteger(fields[4]);
          source.magic = (long)StringToInteger(fields[5]);
          source.comment = UnescapeMemoryField(fields[6]);
          source.volume = StringToDouble(fields[7]);
@@ -3632,8 +3796,8 @@ bool ParseMemorySnapshot(const string payload,
          if(source.source_id == 0 ||
             source.symbol == "" ||
             source.volume <= 0.0 ||
-            (source.position_type != POSITION_TYPE_BUY &&
-             source.position_type != POSITION_TYPE_SELL))
+            (source.position_type != M4_POSITION_TYPE_BUY &&
+             source.position_type != M4_POSITION_TYPE_SELL))
             return false;
 
          int count = ArraySize(loaded);

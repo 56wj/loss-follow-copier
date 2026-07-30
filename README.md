@@ -85,7 +85,7 @@
 - 远程源单部分平仓后，按比例减少跟单手数仍是待办。
 - 如果接收端日志出现 `calculated copy volume is invalid`，通常表示跟单账号没有对应交易品种，或品种后缀不同。先检查市场报价是否有该品种，再配置 `InpSymbolMap`。
 
-## 本机三个统一版本
+## 本机三个 MT5 统一版本
 
 | 文件 | 传输方式 | 额外文件 | DLL imports | 加载顺序 | 默认周期 |
 | --- | --- | --- | --- | --- | --- |
@@ -195,6 +195,26 @@ SL/TP、源单平仓同步、盈利平仓、品种映射和北京时间首单过
 双向互跟要使用两个独立通道：A 端 Sender 与 B 端 Receiver 使用 `A_to_B`，
 B 端 Sender 与 A 端 Receiver 使用 `B_to_A`。每个 Receiver 的源 EA Magic 必须只匹配
 对端策略 Magic，且和本端 `InpCopyMagic` 不同；保持 `InpSenderExcludeOwnCopies=true`。
+
+## MT4↔MT4 / MT4↔MT5 WinAPI 版
+
+`WinApiMemoryLossFollow.mq4` 是 MT4 对端源码，和 MT5 的
+`WinApiMemoryLossFollow.mq5` v1.30 使用同一套 Windows named mapping、mutex、64 字节 header、
+sequence、CRC32 和 `RLMC1` payload。文件扩展名按终端分别使用：
+
+- MT4：编译并挂载 `WinApiMemoryLossFollow.mq4`；
+- MT5：编译并挂载 `WinApiMemoryLossFollow.mq5`；
+- Sender 与 Receiver 可以任意组合为 MT4→MT4、MT4→MT5 或 MT5→MT4；
+- 两端保持相同的 `InpChannelName`、`InpSharedMemoryCapacityKB`；
+- 两端都开启 DLL imports，只调用系统 `kernel32.dll`，没有额外 DLL 文件；
+- MT4 的 `InpCopyMagic` 范围为 `0..2147483647`；
+- MT4 以订单 ticket 作为稳定源 ID，并用 20ms timer + tick 轮询交易变化；
+- 源 EA 匹配、三档跟单、挂单、网格激活、SL/TP、同步平仓、盈利平仓、
+  北京时间首单过滤和 Receiver 面板与 MT5 版保持一致。
+
+混合双向互跟仍使用 `A_to_B`、`B_to_A` 两个通道，每个终端各挂一个 Sender 和一个
+Receiver 实例，并保持 `InpSenderExcludeOwnCopies=true`。共享内存范围仍是同一台
+Windows 主机、同一登录会话。
 
 ## 本机免 DLL 文件版
 
