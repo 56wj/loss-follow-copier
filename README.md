@@ -199,7 +199,7 @@ B 端 Sender 与 A 端 Receiver 使用 `B_to_A`。每个 Receiver 的源 EA Magi
 ## MT4↔MT4 / MT4↔MT5 WinAPI 版
 
 `WinApiMemoryLossFollow.mq4` 是 MT4 对端源码，和 MT5 的
-`WinApiMemoryLossFollow.mq5` v1.30 使用同一套 Windows named mapping、mutex、64 字节 header、
+`WinApiMemoryLossFollow.mq5` v1.31 使用同一套 Windows named mapping、mutex、64 字节 header、
 sequence、CRC32 和 `RLMC1` payload。文件扩展名按终端分别使用：
 
 - MT4：编译并挂载 `WinApiMemoryLossFollow.mq4`；
@@ -270,6 +270,13 @@ EA 当前支持 `源EA1` 和 `源EA2` 两套独立配置。
 适合：网格、补仓、马丁、小止盈大止损类 EA。
 
 ## 浮亏距离模式
+
+浮亏触发值现在允许设置为 `0`：
+
+- 市价触发模式：源单进入快照后立即市价跟单；
+- 提前挂单模式：`0` 直接转为市价跟单，不在源开仓价创建挂单；
+- 网格激活模式：源组合出现后立即激活；
+- 负数仍作为参数错误处理。
 
 ### `LOSS_TRIGGER_PRICE`
 

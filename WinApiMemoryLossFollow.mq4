@@ -3,7 +3,7 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.00"
+#property version   "1.01"
 #property description "MT4 Windows API共享内存跟单：兼容MT5通道，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
@@ -179,8 +179,8 @@ input string             InpEA1CommentFilter     = "";           // 源EA1注释
 input string             InpEA1AllowedSymbols    = "";           // 源EA1允许品种，多个用;或,分隔，空表示全部
 input ENUM_COPY_ENTRY_MODE InpEA1EntryMode       = ENTRY_MARKET_ON_TRIGGER; // 源EA1入场模式
 input ENUM_LOSS_TRIGGER_MODE InpEA1LossMode      = LOSS_TRIGGER_PRICE; // 源EA1档位1浮亏触发模式
-input double             InpEA1LossPrice         = 3.0;          // 源EA1档位1价格距离触发，黄金3.0=浮亏3美金
-input double             InpEA1LossPoints        = 300.0;        // 源EA1档位1点数触发，黄金2位300=3.00，3位3000=3.000
+input double             InpEA1LossPrice         = 3.0;          // 源EA1档位1价格距离触发，0=立即跟单，黄金3.0=浮亏3美金
+input double             InpEA1LossPoints        = 300.0;        // 源EA1档位1点数触发，0=立即跟单，黄金2位300=3.00，3位3000=3.000
 input ENUM_COPY_LOT_MODE InpEA1LotMode           = COPY_LOT_FIXED; // 源EA1档位1跟单手数模式
 input double             InpEA1FixedLot          = 0.01;         // 源EA1档位1固定跟单手数
 input double             InpEA1LotMultiplier     = 1.0;          // 源EA1档位1手数倍数，倍数模式下生效
@@ -188,8 +188,8 @@ input double             InpEA1StopLossPoints    = 0.0;          // 源EA1档位
 input double             InpEA1TakeProfitPoints  = 0.0;          // 源EA1档位1自定义止盈点数，0=不设置
 input bool               InpEA1Level2Enabled     = false;        // 启用源EA1档位2
 input ENUM_LOSS_TRIGGER_MODE InpEA1Level2LossMode = LOSS_TRIGGER_PRICE; // 源EA1档位2浮亏触发模式
-input double             InpEA1Level2LossPrice   = 4.0;          // 源EA1档位2价格距离触发，黄金4.0=浮亏4美金
-input double             InpEA1Level2LossPoints  = 400.0;        // 源EA1档位2点数触发，黄金2位400=4.00，3位4000=4.000
+input double             InpEA1Level2LossPrice   = 4.0;          // 源EA1档位2价格距离触发，0=立即跟单，黄金4.0=浮亏4美金
+input double             InpEA1Level2LossPoints  = 400.0;        // 源EA1档位2点数触发，0=立即跟单，黄金2位400=4.00，3位4000=4.000
 input ENUM_COPY_LOT_MODE InpEA1Level2LotMode     = COPY_LOT_FIXED; // 源EA1档位2跟单手数模式
 input double             InpEA1Level2FixedLot    = 0.01;         // 源EA1档位2固定跟单手数
 input double             InpEA1Level2LotMultiplier = 1.0;        // 源EA1档位2手数倍数，倍数模式下生效
@@ -197,8 +197,8 @@ input double             InpEA1Level2StopLossPoints = 0.0;       // 源EA1档位
 input double             InpEA1Level2TakeProfitPoints = 0.0;     // 源EA1档位2自定义止盈点数，0=不设置
 input bool               InpEA1Level3Enabled     = false;        // 启用源EA1档位3
 input ENUM_LOSS_TRIGGER_MODE InpEA1Level3LossMode = LOSS_TRIGGER_PRICE; // 源EA1档位3浮亏触发模式
-input double             InpEA1Level3LossPrice   = 5.0;          // 源EA1档位3价格距离触发，黄金5.0=浮亏5美金
-input double             InpEA1Level3LossPoints  = 500.0;        // 源EA1档位3点数触发，黄金2位500=5.00，3位5000=5.000
+input double             InpEA1Level3LossPrice   = 5.0;          // 源EA1档位3价格距离触发，0=立即跟单，黄金5.0=浮亏5美金
+input double             InpEA1Level3LossPoints  = 500.0;        // 源EA1档位3点数触发，0=立即跟单，黄金2位500=5.00，3位5000=5.000
 input ENUM_COPY_LOT_MODE InpEA1Level3LotMode     = COPY_LOT_FIXED; // 源EA1档位3跟单手数模式
 input double             InpEA1Level3FixedLot    = 0.01;         // 源EA1档位3固定跟单手数
 input double             InpEA1Level3LotMultiplier = 1.0;        // 源EA1档位3手数倍数，倍数模式下生效
@@ -222,8 +222,8 @@ input string             InpEA2CommentFilter     = "";           // 源EA2注释
 input string             InpEA2AllowedSymbols    = "";           // 源EA2允许品种，多个用;或,分隔，空表示全部
 input ENUM_COPY_ENTRY_MODE InpEA2EntryMode       = ENTRY_MARKET_ON_TRIGGER; // 源EA2入场模式
 input ENUM_LOSS_TRIGGER_MODE InpEA2LossMode      = LOSS_TRIGGER_PRICE; // 源EA2档位1浮亏触发模式
-input double             InpEA2LossPrice         = 3.0;          // 源EA2档位1价格距离触发，黄金3.0=浮亏3美金
-input double             InpEA2LossPoints        = 300.0;        // 源EA2档位1点数触发，黄金2位300=3.00，3位3000=3.000
+input double             InpEA2LossPrice         = 3.0;          // 源EA2档位1价格距离触发，0=立即跟单，黄金3.0=浮亏3美金
+input double             InpEA2LossPoints        = 300.0;        // 源EA2档位1点数触发，0=立即跟单，黄金2位300=3.00，3位3000=3.000
 input ENUM_COPY_LOT_MODE InpEA2LotMode           = COPY_LOT_FIXED; // 源EA2档位1跟单手数模式
 input double             InpEA2FixedLot          = 0.01;         // 源EA2档位1固定跟单手数
 input double             InpEA2LotMultiplier     = 1.0;          // 源EA2档位1手数倍数，倍数模式下生效
@@ -231,8 +231,8 @@ input double             InpEA2StopLossPoints    = 0.0;          // 源EA2档位
 input double             InpEA2TakeProfitPoints  = 0.0;          // 源EA2档位1自定义止盈点数，0=不设置
 input bool               InpEA2Level2Enabled     = false;        // 启用源EA2档位2
 input ENUM_LOSS_TRIGGER_MODE InpEA2Level2LossMode = LOSS_TRIGGER_PRICE; // 源EA2档位2浮亏触发模式
-input double             InpEA2Level2LossPrice   = 4.0;          // 源EA2档位2价格距离触发，黄金4.0=浮亏4美金
-input double             InpEA2Level2LossPoints  = 400.0;        // 源EA2档位2点数触发，黄金2位400=4.00，3位4000=4.000
+input double             InpEA2Level2LossPrice   = 4.0;          // 源EA2档位2价格距离触发，0=立即跟单，黄金4.0=浮亏4美金
+input double             InpEA2Level2LossPoints  = 400.0;        // 源EA2档位2点数触发，0=立即跟单，黄金2位400=4.00，3位4000=4.000
 input ENUM_COPY_LOT_MODE InpEA2Level2LotMode     = COPY_LOT_FIXED; // 源EA2档位2跟单手数模式
 input double             InpEA2Level2FixedLot    = 0.01;         // 源EA2档位2固定跟单手数
 input double             InpEA2Level2LotMultiplier = 1.0;        // 源EA2档位2手数倍数，倍数模式下生效
@@ -240,8 +240,8 @@ input double             InpEA2Level2StopLossPoints = 0.0;       // 源EA2档位
 input double             InpEA2Level2TakeProfitPoints = 0.0;     // 源EA2档位2自定义止盈点数，0=不设置
 input bool               InpEA2Level3Enabled     = false;        // 启用源EA2档位3
 input ENUM_LOSS_TRIGGER_MODE InpEA2Level3LossMode = LOSS_TRIGGER_PRICE; // 源EA2档位3浮亏触发模式
-input double             InpEA2Level3LossPrice   = 5.0;          // 源EA2档位3价格距离触发，黄金5.0=浮亏5美金
-input double             InpEA2Level3LossPoints  = 500.0;        // 源EA2档位3点数触发，黄金2位500=5.00，3位5000=5.000
+input double             InpEA2Level3LossPrice   = 5.0;          // 源EA2档位3价格距离触发，0=立即跟单，黄金5.0=浮亏5美金
+input double             InpEA2Level3LossPoints  = 500.0;        // 源EA2档位3点数触发，0=立即跟单，黄金2位500=5.00，3位5000=5.000
 input ENUM_COPY_LOT_MODE InpEA2Level3LotMode     = COPY_LOT_FIXED; // 源EA2档位3跟单手数模式
 input double             InpEA2Level3FixedLot    = 0.01;         // 源EA2档位3固定跟单手数
 input double             InpEA2Level3LotMultiplier = 1.0;        // 源EA2档位3手数倍数，倍数模式下生效
@@ -1030,15 +1030,15 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
    if(!profile.enabled)
       return true;
 
-   if(profile.loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.loss_trigger_points <= 0.0)
+   if(profile.loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.loss_trigger_points < 0.0)
    {
-      PrintFormat("EA%d loss trigger points must be greater than 0.", index);
+      PrintFormat("EA%d loss trigger points cannot be negative; 0 means immediate copy.", index);
       return false;
    }
 
-   if(profile.loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.loss_trigger_price <= 0.0)
+   if(profile.loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.loss_trigger_price < 0.0)
    {
-      PrintFormat("EA%d loss trigger price must be greater than 0.", index);
+      PrintFormat("EA%d loss trigger price cannot be negative; 0 means immediate copy.", index);
       return false;
    }
 
@@ -1062,15 +1062,15 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
 
    if(profile.level2_enabled)
    {
-      if(profile.level2_loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.level2_loss_trigger_points <= 0.0)
+      if(profile.level2_loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.level2_loss_trigger_points < 0.0)
       {
-         PrintFormat("EA%d level 2 loss trigger points must be greater than 0.", index);
+         PrintFormat("EA%d level 2 loss trigger points cannot be negative; 0 means immediate copy.", index);
          return false;
       }
 
-      if(profile.level2_loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.level2_loss_trigger_price <= 0.0)
+      if(profile.level2_loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.level2_loss_trigger_price < 0.0)
       {
-         PrintFormat("EA%d level 2 loss trigger price must be greater than 0.", index);
+         PrintFormat("EA%d level 2 loss trigger price cannot be negative; 0 means immediate copy.", index);
          return false;
       }
 
@@ -1095,15 +1095,15 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
 
    if(profile.level3_enabled)
    {
-      if(profile.level3_loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.level3_loss_trigger_points <= 0.0)
+      if(profile.level3_loss_trigger_mode == LOSS_TRIGGER_POINTS && profile.level3_loss_trigger_points < 0.0)
       {
-         PrintFormat("EA%d level 3 loss trigger points must be greater than 0.", index);
+         PrintFormat("EA%d level 3 loss trigger points cannot be negative; 0 means immediate copy.", index);
          return false;
       }
 
-      if(profile.level3_loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.level3_loss_trigger_price <= 0.0)
+      if(profile.level3_loss_trigger_mode == LOSS_TRIGGER_PRICE && profile.level3_loss_trigger_price < 0.0)
       {
-         PrintFormat("EA%d level 3 loss trigger price must be greater than 0.", index);
+         PrintFormat("EA%d level 3 loss trigger price cannot be negative; 0 means immediate copy.", index);
          return false;
       }
 
@@ -3278,8 +3278,29 @@ bool PlaceCopyPending(const ulong source_ticket,
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double trigger_distance = TriggerDistancePrice(symbol, profile, level_index);
-   if(trigger_distance <= 0.0 || point <= 0.0)
+   if(trigger_distance < 0.0 || point <= 0.0)
       return false;
+
+   // A zero loss distance means immediate market copy in every entry mode.
+   // Do not place a pending order at the source open price in this case.
+   if(trigger_distance == 0.0)
+   {
+      double immediate_loss_points = FloatingLossPoints(symbol, position_type, source_open_price);
+      double immediate_loss_price = immediate_loss_points * point;
+      if(!OpenCopyTrade(source_ticket,
+                        symbol,
+                        position_type,
+                        volume,
+                        source_sl,
+                        source_tp,
+                        immediate_loss_points,
+                        immediate_loss_price,
+                        profile,
+                        level_index))
+         return false;
+      MarkCopied(source_ticket, level_index);
+      return true;
+   }
 
    double trigger_price = position_type == M4_POSITION_TYPE_BUY
                           ? source_open_price - trigger_distance
@@ -3294,8 +3315,9 @@ bool PlaceCopyPending(const ulong source_ticket,
    {
       double loss_points = FloatingLossPoints(symbol, position_type, source_open_price);
       double loss_price = loss_points * point;
-      if(OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, loss_points, loss_price, profile, level_index))
-         MarkCopied(source_ticket, level_index);
+      if(!OpenCopyTrade(source_ticket, symbol, position_type, volume, source_sl, source_tp, loss_points, loss_price, profile, level_index))
+         return false;
+      MarkCopied(source_ticket, level_index);
       return true;
    }
 

@@ -15,6 +15,14 @@ FILES = {
     "file_snapshot": ROOT / "FileLossFollow.mq5",
 }
 MT4_WINAPI = ROOT / "WinApiMemoryLossFollow.mq4"
+ZERO_TRIGGER_FILES = {
+    "mt4_winapi": MT4_WINAPI,
+    "mt5_winapi": ROOT / "WinApiMemoryLossFollow.mq5",
+    "dll_memory": ROOT / "MemoryLossFollow.mq5",
+    "file_snapshot": ROOT / "FileLossFollow.mq5",
+    "same_account": ROOT / "LossFollowCopier.mq5",
+    "remote_receiver": ROOT / "RemoteLossFollowReceiver.mq5",
+}
 
 EVENTS = (
     "OnInit",
@@ -454,6 +462,43 @@ def main() -> int:
         mt5_body = normalize_core(extract_function(winapi, function_name))
         if mt4_body != mt5_body:
             fail(f"MT4/MT5 protocol drift in {function_name}")
+
+    negative_trigger_checks = (
+        "profile.loss_trigger_points < 0.0",
+        "profile.loss_trigger_price < 0.0",
+        "profile.level2_loss_trigger_points < 0.0",
+        "profile.level2_loss_trigger_price < 0.0",
+        "profile.level3_loss_trigger_points < 0.0",
+        "profile.level3_loss_trigger_price < 0.0",
+    )
+    forbidden_zero_checks = tuple(check.replace(" < ", " <= ") for check in negative_trigger_checks)
+    for name, path in ZERO_TRIGGER_FILES.items():
+        source = path.read_text(encoding="utf-8-sig")
+        validate_profile = extract_function(source, "ValidateProfile")
+        for token in negative_trigger_checks:
+            if token not in validate_profile:
+                fail(f"{name}: zero loss trigger is not accepted: {token}")
+        for token in forbidden_zero_checks:
+            if token in validate_profile:
+                fail(f"{name}: zero loss trigger is still rejected: {token}")
+
+        loss_trigger = extract_function(source, "IsLossTriggered")
+        for token in ("loss_price >= LevelLossPrice", "loss_points >= LevelLossPoints"):
+            if token not in loss_trigger:
+                fail(f"{name}: immediate market/grid trigger behavior missing: {token}")
+
+        pending = extract_function(source, "PlaceCopyPending")
+        zero_index = pending.find("if(trigger_distance == 0.0)")
+        price_index = pending.find("double trigger_price")
+        if not (0 <= zero_index < price_index):
+            fail(f"{name}: zero pending distance must switch to market before price placement")
+        for token in (
+            "immediate_loss_points",
+            "if(!OpenCopyTrade",
+            "MarkCopied(source_ticket, level_index);",
+        ):
+            if token not in pending[zero_index:price_index]:
+                fail(f"{name}: zero pending market path missing: {token}")
 
     print("EA variant validation OK")
     for name in FILES:
