@@ -171,8 +171,14 @@ SL/TP、源单平仓同步、盈利平仓、品种映射和北京时间首单过
 - `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)` 创建系统分页文件支持的命名共享内存；
 - `MapViewOfFile` 映射同名内存，两个 MT5 任意顺序启动，先启动的一端负责初始化；
 - Windows named mutex 串行化读写，避免读取写到一半的 payload；
+- 通道名附加稳定哈希，避免名称清洗或截断后让不同通道误用同一 Windows 对象；
+- 每个通道只允许一个 Sender；同一通道、接收账户和 `InpCopyMagic` 只允许一个 Receiver，
+  避免重复挂载后重复跟单；
+- Sender 默认启用 `InpSenderExcludeOwnCopies`，不把本版本产生的跟单仓再次发布，
+  双向互跟时阻断 A→B→A 的循环复制；
 - header sequence + payload CRC32 校验，并在发送端重启时续接 sequence；
 - Receiver 保留最后一份完整快照，并用 stale timeout 阻止旧快照继续开单；
+- 毫秒定时器启动失败时终止初始化并释放 mapping、mutex 和角色占用锁；
 - 只支持 Windows x64，同一 Windows 登录会话中的 MT5 进程。
 
 安装：
@@ -183,6 +189,12 @@ SL/TP、源单平仓同步、盈利平仓、品种映射和北京时间首单过
 3. 源账号选择 `MEMORY_FOLLOW_SENDER`，跟单账号选择 `MEMORY_FOLLOW_RECEIVER`。
 4. 两边的 `InpChannelName` 和 `InpSharedMemoryCapacityKB` 必须一致。
 5. Sender/Receiver 没有加载顺序限制，默认轮询周期为 `20ms/20ms`。
+6. 面板的“暂停新开”不会删除已经存在的跟单挂单；需要阻止挂单后续成交时，
+   再点击“删除挂单”（该按钮也会自动保持暂停新开）。
+
+双向互跟要使用两个独立通道：A 端 Sender 与 B 端 Receiver 使用 `A_to_B`，
+B 端 Sender 与 A 端 Receiver 使用 `B_to_A`。每个 Receiver 的源 EA Magic 必须只匹配
+对端策略 Magic，且和本端 `InpCopyMagic` 不同；保持 `InpSenderExcludeOwnCopies=true`。
 
 ## 本机免 DLL 文件版
 

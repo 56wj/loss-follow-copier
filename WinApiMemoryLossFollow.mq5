@@ -3,7 +3,7 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.10"
+#property version   "1.20"
 #property description "Windows API共享内存跟单：统一角色切换，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
@@ -23,6 +23,7 @@ int  ReadProcessMemory(long process_handle, long base_address, uchar &buffer[], 
 #define WINAPI_FILE_MAP_ALL_ACCESS  0x000F001F
 #define WINAPI_WAIT_OBJECT_0        0x00000000
 #define WINAPI_WAIT_ABANDONED       0x00000080
+#define WINAPI_WAIT_TIMEOUT         0x00000102
 #define WINAPI_MEMORY_MAGIC         0x574D4C46
 #define WINAPI_MEMORY_VERSION       1
 
@@ -140,6 +141,7 @@ input int                InpSharedMemoryCapacityKB = 1024;                  // �
 
 input group "发送端设置（仅Sender角色）"
 input string             InpSenderAllowedSymbols = "";                     // 发布品种，空表示全部
+input bool               InpSenderExcludeOwnCopies = true;                 // 不回传本版本跟单仓，双向互跟时防止循环复制
 input int                InpSenderPublishIntervalMs = 20;                   // 建议20毫秒；最低10毫秒
 input bool               InpSenderPauseWhenAutoTradingOff = true;           // 自动交易关闭时发布暂停状态
 
@@ -257,6 +259,10 @@ uchar g_memory_buffer[];
 long g_winapi_mapping_handle = 0;
 long g_winapi_view_address = 0;
 long g_winapi_mutex_handle = 0;
+long g_winapi_writer_guard_handle = 0;
+bool g_winapi_writer_guard_owned = false;
+long g_winapi_receiver_guard_handle = 0;
+bool g_winapi_receiver_guard_owned = false;
 long g_winapi_process_handle = 0;
 ulong g_winapi_last_read_sequence = 0;
 int g_winapi_last_error = 0;
@@ -295,6 +301,18 @@ uint WinApiMemoryCrc32(const uchar &data[], const int size)
    return crc ^ 0xFFFFFFFF;
 }
 
+uint WinApiMemoryNameHash(const string value)
+{
+   uint hash = 2166136261;
+   int length = StringLen(value);
+   for(int i = 0; i < length; i++)
+   {
+      hash ^= (uint)StringGetCharacter(value, i);
+      hash = (uint)(hash * 16777619);
+   }
+   return hash;
+}
+
 string WinApiMemoryObjectPart()
 {
    string value = SanitizeNamePart(InpChannelName);
@@ -302,9 +320,64 @@ string WinApiMemoryObjectPart()
    StringReplace(value, "\t", "_");
    StringReplace(value, "\r", "_");
    StringReplace(value, "\n", "_");
-   if(StringLen(value) > 80)
-      value = StringSubstr(value, 0, 80);
-   return value;
+   if(StringLen(value) > 48)
+      value = StringSubstr(value, 0, 48);
+   return value + "_" + IntegerToString((long)WinApiMemoryNameHash(InpChannelName));
+}
+
+string WinApiMemoryErrorDescription(const int error_code)
+{
+   switch(error_code)
+   {
+      case 0:    return "ok";
+      case -101: return "CreateFileMappingW failed";
+      case -102: return "MapViewOfFile failed or capacity mismatch";
+      case -103: return "CreateMutexW failed";
+      case -104: return "shared mutex is not open";
+      case -105: return "shared mutex wait timed out or failed";
+      case -106: return "shared header/version/capacity mismatch";
+      case -107: return "invalid write buffer or payload size";
+      case -108: return "shared header became invalid before write";
+      case -109: return "payload write failed";
+      case -110: return "shared header commit failed";
+      case -111: return "shared view or read buffer is invalid";
+      case -112: return "shared header became invalid before read";
+      case -113: return "published payload size is invalid";
+      case -114: return "payload read failed";
+      case -115: return "payload CRC32 mismatch";
+      case -116: return "sender guard mutex creation failed";
+      case -117: return "another Sender already owns this channel";
+      case -118: return "sender guard mutex wait failed";
+      case -119: return "receiver guard mutex creation failed";
+      case -120: return "another Receiver already owns this channel/account/magic";
+      case -121: return "receiver guard mutex wait failed";
+   }
+   return "unknown WinAPI shared-memory error";
+}
+
+bool WinApiMemoryAcquireGuard(const string object_name,
+                              long &guard_handle,
+                              bool &guard_owned,
+                              const int create_error,
+                              const int busy_error,
+                              const int wait_error)
+{
+   guard_handle = CreateMutexW(0, 0, object_name);
+   if(guard_handle == 0)
+   {
+      g_winapi_last_error = create_error;
+      return false;
+   }
+
+   uint wait_result = WaitForSingleObject(guard_handle, 0);
+   if(wait_result == WINAPI_WAIT_OBJECT_0 || wait_result == WINAPI_WAIT_ABANDONED)
+   {
+      guard_owned = true;
+      return true;
+   }
+
+   g_winapi_last_error = wait_result == WINAPI_WAIT_TIMEOUT ? busy_error : wait_error;
+   return false;
 }
 
 bool WinApiMemoryLock(const uint timeout_ms = 100)
@@ -388,6 +461,38 @@ bool WinApiMemoryOpen()
    string object_part = WinApiMemoryObjectPart();
    string mapping_name = "Local\\MQL5_WMLF_MAP_" + object_part;
    string mutex_name = "Local\\MQL5_WMLF_MUTEX_" + object_part;
+   string writer_guard_name = "Local\\MQL5_WMLF_WRITER_" + object_part;
+   string receiver_guard_name = "Local\\MQL5_WMLF_RECEIVER_" + object_part + "_" +
+                                IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
+                                IntegerToString((long)InpCopyMagic) + "_" +
+                                IntegerToString((long)WinApiMemoryNameHash(AccountInfoString(ACCOUNT_SERVER)));
+
+   if(InpMemoryRole == MEMORY_FOLLOW_SENDER)
+   {
+      if(!WinApiMemoryAcquireGuard(writer_guard_name,
+                                   g_winapi_writer_guard_handle,
+                                   g_winapi_writer_guard_owned,
+                                   -116,
+                                   -117,
+                                   -118))
+      {
+         WinApiMemoryClose();
+         return false;
+      }
+   }
+   else
+   {
+      if(!WinApiMemoryAcquireGuard(receiver_guard_name,
+                                   g_winapi_receiver_guard_handle,
+                                   g_winapi_receiver_guard_owned,
+                                   -119,
+                                   -120,
+                                   -121))
+      {
+         WinApiMemoryClose();
+         return false;
+      }
+   }
 
    g_winapi_mapping_handle = CreateFileMappingW((long)-1,
                                                  0,
@@ -398,6 +503,7 @@ bool WinApiMemoryOpen()
    if(g_winapi_mapping_handle == 0)
    {
       g_winapi_last_error = -101;
+      WinApiMemoryClose();
       return false;
    }
 
@@ -480,6 +586,22 @@ void WinApiMemoryClose()
    {
       CloseHandle(g_winapi_mutex_handle);
       g_winapi_mutex_handle = 0;
+   }
+   if(g_winapi_writer_guard_handle != 0)
+   {
+      if(g_winapi_writer_guard_owned)
+         ReleaseMutex(g_winapi_writer_guard_handle);
+      CloseHandle(g_winapi_writer_guard_handle);
+      g_winapi_writer_guard_handle = 0;
+      g_winapi_writer_guard_owned = false;
+   }
+   if(g_winapi_receiver_guard_handle != 0)
+   {
+      if(g_winapi_receiver_guard_owned)
+         ReleaseMutex(g_winapi_receiver_guard_handle);
+      CloseHandle(g_winapi_receiver_guard_handle);
+      g_winapi_receiver_guard_handle = 0;
+      g_winapi_receiver_guard_owned = false;
    }
    g_winapi_process_handle = 0;
 }
@@ -863,12 +985,23 @@ int InitMemorySender()
    g_memory_capacity_bytes = InpSharedMemoryCapacityKB * 1024;
    if(!WinApiMemoryOpen())
    {
-      PrintFormat("Open WinAPI shared memory failed. role=sender channel=%s error=%d", InpChannelName, g_winapi_last_error);
+      PrintFormat("Open WinAPI shared memory failed. role=sender channel=%s error=%d (%s)",
+                  InpChannelName,
+                  g_winapi_last_error,
+                  WinApiMemoryErrorDescription(g_winapi_last_error));
       return INIT_FAILED;
    }
 
    int timer_period = InpSenderPublishIntervalMs < 10 ? 10 : InpSenderPublishIntervalMs;
-   EventSetMillisecondTimer((uint)timer_period);
+   ResetLastError();
+   if(!EventSetMillisecondTimer((uint)timer_period))
+   {
+      PrintFormat("Start sender millisecond timer failed. period=%d error=%d",
+                  timer_period,
+                  GetLastError());
+      WinApiMemoryClose();
+      return INIT_FAILED;
+   }
    SenderWriteSnapshot();
    return INIT_SUCCEEDED;
 }
@@ -909,7 +1042,10 @@ int InitMemoryReceiver()
    ArrayResize(g_memory_buffer, g_memory_capacity_bytes);
    if(!WinApiMemoryOpen())
    {
-      PrintFormat("Open WinAPI shared memory failed. role=receiver channel=%s error=%d", InpChannelName, g_winapi_last_error);
+      PrintFormat("Open WinAPI shared memory failed. role=receiver channel=%s error=%d (%s)",
+                  InpChannelName,
+                  g_winapi_last_error,
+                  WinApiMemoryErrorDescription(g_winapi_last_error));
       return INIT_FAILED;
    }
 
@@ -917,14 +1053,22 @@ int InitMemoryReceiver()
               IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
               SanitizeNamePart(InpChannelName) + "_";
 
-   PanelInitialize();
-
    ENUM_ACCOUNT_MARGIN_MODE margin_mode = (ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE);
    if(margin_mode != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
       Print("Warning: this EA is designed for hedging accounts. On netting accounts, source and copy positions may merge.");
 
    int timer_period = InpScanIntervalMs < 10 ? 10 : InpScanIntervalMs;
-   EventSetMillisecondTimer((uint)timer_period);
+   ResetLastError();
+   if(!EventSetMillisecondTimer((uint)timer_period))
+   {
+      PrintFormat("Start receiver millisecond timer failed. period=%d error=%d",
+                  timer_period,
+                  GetLastError());
+      WinApiMemoryClose();
+      return INIT_FAILED;
+   }
+
+   PanelInitialize();
    LoadMemorySnapshot(true);
    return INIT_SUCCEEDED;
 }
@@ -934,12 +1078,9 @@ void OnDeinit(const int reason)
    EventKillTimer();
    if(PanelRoleIsReceiver())
       PanelDestroy();
-   if(g_winapi_view_address != 0)
-   {
-      if(InpMemoryRole == MEMORY_FOLLOW_SENDER)
-         SenderWritePausedSnapshot("sender_stopped");
-      WinApiMemoryClose();
-   }
+   if(g_winapi_view_address != 0 && InpMemoryRole == MEMORY_FOLLOW_SENDER)
+      SenderWritePausedSnapshot("sender_stopped");
+   WinApiMemoryClose();
 }
 
 void OnTick()
@@ -1030,14 +1171,21 @@ string SenderBuildSnapshotText(const ulong sequence,
       if(type != POSITION_TYPE_BUY && type != POSITION_TYPE_SELL)
          continue;
 
+      long position_magic = PositionGetInteger(POSITION_MAGIC);
+      string position_comment = PositionGetString(POSITION_COMMENT);
+      if(InpSenderExcludeOwnCopies &&
+         ((ulong)position_magic == InpCopyMagic ||
+          StringFind(position_comment, "WMLFC:") == 0))
+         continue;
+
       long identifier = PositionGetInteger(POSITION_IDENTIFIER);
       ulong source_id = identifier > 0 ? (ulong)identifier : ticket;
       text += "P\t" + IntegerToString((long)source_id) +
               "\t" + IntegerToString((long)ticket) +
               "\t" + EscapeMemoryField(symbol) +
               "\t" + IntegerToString((int)type) +
-              "\t" + IntegerToString(PositionGetInteger(POSITION_MAGIC)) +
-              "\t" + EscapeMemoryField(PositionGetString(POSITION_COMMENT)) +
+              "\t" + IntegerToString(position_magic) +
+              "\t" + EscapeMemoryField(position_comment) +
               "\t" + DoubleToString(PositionGetDouble(POSITION_VOLUME), 8) +
               "\t" + DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN), 10) +
               "\t" + DoubleToString(PositionGetDouble(POSITION_SL), 10) +
@@ -1123,7 +1271,11 @@ void PrintSenderMemoryError(const string action, const int error_code)
    if(now == g_last_error_print)
       return;
    g_last_error_print = now;
-   PrintFormat("%s. channel=%s error=%d", action, InpChannelName, error_code);
+   PrintFormat("%s. channel=%s error=%d (%s)",
+               action,
+               InpChannelName,
+               error_code,
+               WinApiMemoryErrorDescription(error_code));
 }
 
 string EscapeMemoryField(string value)
@@ -3551,7 +3703,11 @@ void PrintMemoryReadError(const string message, const int error_code)
       return;
 
    g_last_memory_error_log = now;
-   PrintFormat("%s. channel=%s error=%d", message, InpChannelName, error_code);
+   PrintFormat("%s. channel=%s error=%d (%s)",
+               message,
+               InpChannelName,
+               error_code,
+               WinApiMemoryErrorDescription(error_code));
 }
 
 bool MemorySourceById(const ulong source_id, MemorySourcePosition& source)

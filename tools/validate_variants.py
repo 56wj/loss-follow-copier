@@ -221,6 +221,12 @@ def main() -> int:
         "CreateMutexW",
         "ReadProcessMemory",
         "WriteProcessMemory",
+        "g_winapi_writer_guard_handle",
+        "g_winapi_receiver_guard_handle",
+        "another Sender already owns this channel",
+        "another Receiver already owns this channel/account/magic",
+        "WinApiMemoryNameHash",
+        "InpSenderExcludeOwnCopies",
         "RLMC1",
     ):
         if token not in winapi:
@@ -228,6 +234,39 @@ def main() -> int:
     for token in ("RlfcMemoryBridge", "RLFC_Open", "FILE_COMMON", "FileOpen", "FileMove"):
         if token in winapi:
             fail(f"winapi_memory: unexpected transport token {token}")
+
+    winapi_open = extract_function(winapi, "WinApiMemoryOpen")
+    mapping_index = winapi_open.find("CreateFileMappingW")
+    for role in ("writer", "receiver"):
+        guard_index = winapi_open.find(f"WinApiMemoryAcquireGuard({role}_guard_name")
+        if guard_index < 0 or mapping_index < 0 or guard_index > mapping_index:
+            fail(f"winapi_memory: {role} guard must be acquired before opening the mapping")
+    mapping_failure = re.search(
+        r"if\s*\(g_winapi_mapping_handle\s*==\s*0\)\s*\{([^{}]*)\}",
+        winapi_open,
+        re.DOTALL,
+    )
+    if not mapping_failure or "WinApiMemoryClose();" not in mapping_failure.group(1):
+        fail("winapi_memory: mapping-open failure must release the role guard")
+
+    winapi_close = extract_function(winapi, "WinApiMemoryClose")
+    for token in (
+        "ReleaseMutex(g_winapi_writer_guard_handle)",
+        "ReleaseMutex(g_winapi_receiver_guard_handle)",
+        "CloseHandle(g_winapi_writer_guard_handle)",
+        "CloseHandle(g_winapi_receiver_guard_handle)",
+    ):
+        if token not in winapi_close:
+            fail(f"winapi_memory: role guard cleanup missing: {token}")
+
+    for init_name in ("InitMemorySender", "InitMemoryReceiver"):
+        init_body = extract_function(winapi, init_name)
+        if "if(!EventSetMillisecondTimer" not in init_body or "WinApiMemoryClose();" not in init_body:
+            fail(f"winapi_memory: {init_name} must fail closed when the timer cannot start")
+
+    sender_snapshot = extract_function(winapi, "SenderBuildSnapshotText")
+    if "InpSenderExcludeOwnCopies" not in sender_snapshot or 'StringFind(position_comment, "WMLFC:")' not in sender_snapshot:
+        fail("winapi_memory: Sender must suppress WinAPI copy positions for two-way loop prevention")
 
     if imports(file_snapshot):
         fail("file_snapshot: DLL import found")
