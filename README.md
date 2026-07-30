@@ -85,6 +85,96 @@
 - 远程源单部分平仓后，按比例减少跟单手数仍是待办。
 - 如果接收端日志出现 `calculated copy volume is invalid`，通常表示跟单账号没有对应交易品种，或品种后缀不同。先检查市场报价是否有该品种，再配置 `InpSymbolMap`。
 
+## 本机三个统一版本
+
+| 文件 | 传输方式 | 额外文件 | DLL imports | 加载顺序 | 默认周期 |
+| --- | --- | --- | --- | --- | --- |
+| `MemoryLossFollow.mq5` | 双缓冲命名共享内存 | `RlfcMemoryBridge.dll` | 两端开启 | 任意 | `20ms/20ms` |
+| `WinApiMemoryLossFollow.mq5` | Windows API 命名共享内存 | 无额外 DLL | 两端开启 | 任意 | `20ms/20ms` |
+| `FileLossFollow.mq5` | MT5 `FILE_COMMON` 文件快照 | 无 | 关闭即可 | 任意 | `50ms/50ms` |
+
+三个版本使用不同的默认 `InpCopyMagic`、订单注释和全局变量前缀，可以并行测试，
+但同一跟单账号正式运行时应只选择一个版本，避免对同一源单重复跟单。
+
+## 本机共享内存版
+
+追求同机双 MT5 更低延迟时使用：
+
+- `MemoryLossFollow.mq5`：同一个 EA，通过 `InpMemoryRole` 选择 Sender 或 Receiver
+- `memory-bridge/`：Windows x64 共享内存 DLL 工程
+
+内存版保留远程 Receiver 的源 EA 匹配、三档跟单、挂单、网格激活、
+SL/TP、源单平仓同步、盈利平仓、品种映射和北京时间首单过滤逻辑，
+只把 `FILE_COMMON` 快照替换为双缓冲共享内存。
+
+数据通路：
+
+`源MT5 -> MemoryLossFollow(Sender) -> RlfcMemoryBridge.dll -> Local\\共享内存 -> MemoryLossFollow(Receiver) -> 跟单账号`
+
+共享内存保护包括：
+
+- inactive slot 写入完成后再原子切换 active slot；
+- sequence 前后保护，拒绝并发覆盖期间的不一致读取；
+- CRC32 校验完整 payload；
+- 同通道 writer mutex，避免多个发送端同时覆盖；
+- Receiver 保留上一份完整快照，并在每个行情 tick 上继续判断浮亏触发。
+
+安装：
+
+1. 在 Windows x64 + Visual Studio 2022 环境运行 `memory-bridge/build.ps1`。
+2. 把生成的 `RlfcMemoryBridge.dll` 放进两个终端各自的 `MQL5/Libraries/`。
+3. 两个终端都编译并挂载 `MemoryLossFollow.mq5`，勾选 **Allow DLL imports**。
+4. 源账号设置 `InpMemoryRole=MEMORY_FOLLOW_SENDER`，跟单账号设置为 `MEMORY_FOLLOW_RECEIVER`。
+5. 两边保持相同的 `InpChannelName` 和 `InpSharedMemoryCapacityKB`。
+6. Sender/Receiver 任意顺序加载；建议周期分别使用 `20ms/20ms`，先在模拟盘测延迟日志和完整交易周期。
+
+共享内存只适用于同一台 Windows 主机、同一登录会话中的多个 MT5 进程；
+跨机器仍使用网络 API/WebSocket 方案。
+
+## 本机 Windows API 共享内存版（无额外 DLL 文件）
+
+`WinApiMemoryLossFollow.mq5` 是当前推荐的同机低延迟版本。它仍是一个 EA，
+通过 `InpMemoryRole` 切换 Sender/Receiver，但直接导入 Windows 自带的
+`kernel32.dll`，不再依赖、编译或复制 `RlfcMemoryBridge.dll`。
+
+数据通路：
+
+`源MT5 -> WinApiMemoryLossFollow -> kernel32 命名共享内存 -> WinApiMemoryLossFollow -> 跟单账号`
+
+实现与保护：
+
+- `CreateFileMappingW(INVALID_HANDLE_VALUE, ...)` 创建系统分页文件支持的命名共享内存；
+- `MapViewOfFile` 映射同名内存，两个 MT5 任意顺序启动，先启动的一端负责初始化；
+- Windows named mutex 串行化读写，避免读取写到一半的 payload；
+- header sequence + payload CRC32 校验，并在发送端重启时续接 sequence；
+- Receiver 保留最后一份完整快照，并用 stale timeout 阻止旧快照继续开单；
+- 只支持 Windows x64，同一 Windows 登录会话中的 MT5 进程。
+
+安装：
+
+1. 把 `WinApiMemoryLossFollow.mq5` 分别放进两个终端的 `MQL5/Experts/` 并编译。
+2. 两个终端挂载同一个 EA，并都勾选 **Allow DLL imports**；这里只加载 Windows
+   系统自带的 `kernel32.dll`，无需向 `MQL5/Libraries/` 复制任何 DLL。
+3. 源账号选择 `MEMORY_FOLLOW_SENDER`，跟单账号选择 `MEMORY_FOLLOW_RECEIVER`。
+4. 两边的 `InpChannelName` 和 `InpSharedMemoryCapacityKB` 必须一致。
+5. Sender/Receiver 没有加载顺序限制，默认轮询周期为 `20ms/20ms`。
+
+## 本机免 DLL 文件版
+
+`FileLossFollow.mq5` 是一个纯 MQL5 的统一 Sender/Receiver EA，使用 MT5
+内置的 `FILE_COMMON` 公共目录交换快照：
+
+- 源账号设置 `InpFileRole=FILE_FOLLOW_SENDER`；
+- 跟单账号设置 `InpFileRole=FILE_FOLLOW_RECEIVER`；
+- 两端只需保持 `InpChannelName` 一致；
+- 不依赖 DLL，不需要勾选 DLL imports；
+- Sender 或 Receiver 任意一端先加载都可以，Receiver 在快照出现前保持等待状态；
+- 使用临时文件写入后原子替换、RLFC2 sequence、数量和结束标记校验，避免读取半截快照。
+
+该版本保留与远程 Receiver 相同的源 EA 匹配、三档跟单、挂单、网格激活、
+SL/TP、同步平仓、盈利平仓、品种映射和北京时间首单过滤逻辑。默认文件
+轮询为 `50ms/50ms`，部署最简单；追求更低传输延迟时再使用上面的共享内存版。
+
 ## 核心参数
 
 ### 源 EA 匹配
