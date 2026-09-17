@@ -4,7 +4,7 @@
 //|  One EA file; role is selected from inputs.                     |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.15"
+#property version   "1.20"
 #property description "本机文件浮亏跟单：统一角色切换，Receiver内嵌控制面板。"
 
 enum ENUM_FILE_FOLLOW_ROLE
@@ -217,6 +217,7 @@ input int                InpDeviationPoints      = 100;          // 允许滑点
 input string             InpSymbolMap            = "";           // 品种映射，源=跟单；多个用;分隔，例如 XAUUSD=XAUUSDm
 input ENUM_COPY_DIRECTION_FILTER InpCopyDirection = COPY_DIRECTION_BOTH; // 跟单方向：都跟/只跟买单/只跟卖单
 input bool               InpCloseCopyWithSource  = true;         // 源单平仓后跟单一起市价平仓
+input int                InpSourceCloseConfirmSnapshots = 2;                // 连续多少个新快照缺少源单才同步平仓，防止成交瞬间竞态
 input int                InpCloseRetrySeconds    = 3;            // 同一跟单平仓失败后的重试间隔秒数
 input bool               InpOneCopyPerPosition   = true;         // 每个源单只跟一次
 input bool               InpStopRoundAfterAllCopiesClosed = true; // 接收端本组跟单全部平仓后，本轮停跟至源端本组清空
@@ -231,6 +232,7 @@ input ENUM_BASE_CORNER   InpPanelCorner          = CORNER_LEFT_UPPER; // 面板�
 input int                InpPanelX               = 10;           // 面板水平偏移
 input int                InpPanelY               = 20;           // 面板垂直偏移
 input int                InpPanelRefreshMs       = 250;          // 面板刷新周期，最低100毫秒
+input int                InpPanelSourceRows      = 8;            // 面板显示的快照源单明细行数，范围1~12
 
 string g_prefix;
 string g_snapshot_file;
@@ -239,6 +241,15 @@ datetime g_snapshot_time = 0;
 bool g_have_snapshot = false;
 bool g_snapshot_fresh = false;
 ulong g_snapshot_sequence = 0;
+
+struct MissingSourceConfirmation
+{
+   ulong copy_ticket;
+   ulong source_id;
+   ulong last_sequence;
+   int   missing_snapshots;
+};
+MissingSourceConfirmation g_missing_source_confirmations[];
 ulong g_snapshot_publish_tick_ms = 0;
 ulong g_last_snapshot_read_tick_ms = 0;
 datetime g_last_snapshot_error_log = 0;
@@ -558,8 +569,10 @@ int InitFileReceiver()
 
    g_snapshot_file = SnapshotFileName();
    g_prefix = "FLFC_" +
-              IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "_" +
-              SanitizeNamePart(InpChannelName) + "_";
+              IntegerToString((long)LossFollowNameHash(
+                 IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "|" +
+                 InpChannelName + "|" +
+                 IntegerToString((long)InpCopyMagic))) + "_";
 
    PanelInitialize();
 
@@ -585,8 +598,8 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   if(InpFileRole == FILE_FOLLOW_RECEIVER)
-      CheckPositions();
+   // Receiver synchronization is timer-driven. Running the full scan on every quote
+   // duplicates work on high-tick symbols and can make the terminal UI stutter.
 }
 
 void OnTimer()
@@ -611,7 +624,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 {
    if(InpFileRole == FILE_FOLLOW_SENDER)
    {
-      SenderWriteSnapshot();
+      // Defer publication to OnTimer: position enumeration can be transient inside this callback.
       return;
    }
 
@@ -961,8 +974,8 @@ void PanelInitialize()
 
    int x = InpPanelX;
    int y = InpPanelY;
-   PanelCreateBackground("BG", x, y, 390, 305, C'24,29,38', C'62,77,98');
-   PanelCreateBackground("HEADER_BG", x + 1, y + 1, 388, 34, C'35,94,150', C'35,94,150');
+   PanelCreateBackground("BG", x, y, 540, 570, C'24,29,38', C'62,77,98');
+   PanelCreateBackground("HEADER_BG", x + 1, y + 1, 538, 34, C'35,94,150', C'35,94,150');
    PanelCreateLabel("TITLE", x + 14, y + 8, "LOSS FOLLOW  跟单控制面板", clrWhite, 11);
    PanelCreateLabel("TRANSPORT", x + 14, y + 43, "传输：--", clrSilver);
    PanelCreateLabel("ACCOUNT", x + 14, y + 64, "账户：--", clrSilver);
@@ -977,6 +990,11 @@ void PanelInitialize()
    PanelCreateButton("BTN_CLOSE", x + 139, y + 238, 112, 30, "全部平仓", C'161,52,58');
    PanelCreateButton("BTN_DELETE", x + 266, y + 238, 112, 30, "删除挂单", C'115,68,143');
    PanelCreateLabel("ACTION", x + 14, y + 278, "操作：就绪", clrDarkGray, 8);
+   PanelCreateLabel("SOURCE_TITLE", x + 14, y + 310, "快照源单明细（当前接收数据）", clrDeepSkyBlue, 9);
+   PanelCreateLabel("SOURCE_HEAD", x + 14, y + 331, "序号  方向  品种       手数     开仓价       估算盈亏      源单ID", clrSilver, 8);
+   int source_rows = InpPanelSourceRows < 1 ? 1 : (InpPanelSourceRows > 12 ? 12 : InpPanelSourceRows);
+   for(int i = 0; i < source_rows; i++)
+      PanelCreateLabel("SOURCE_ROW_" + IntegerToString(i), x + 14, y + 352 + i * 17, "", clrSilver, 8);
    PanelUpdate(true);
 }
 
@@ -1031,6 +1049,43 @@ void PanelCollectCopyStats(int &position_count,
          continue;
       pending_count++;
    }
+}
+
+void PanelUpdateSourceRows()
+{
+   int rows = InpPanelSourceRows < 1 ? 1 : (InpPanelSourceRows > 12 ? 12 : InpPanelSourceRows);
+   int total = ArraySize(g_sources);
+   for(int i = 0; i < rows; i++)
+   {
+      string suffix = "SOURCE_ROW_" + IntegerToString(i);
+      if(i >= total)
+      {
+         PanelSetLabel(suffix, i == 0 ? "（当前快照没有源单）" : "", clrDarkGray);
+         continue;
+      }
+
+      string local_symbol = LocalSymbolForSource(g_sources[i].symbol);
+      double estimated_profit = SourcePositionProfitMoney(local_symbol,
+                                                          g_sources[i].position_type,
+                                                          g_sources[i].open_price,
+                                                          g_sources[i].volume);
+      string direction = (int)g_sources[i].position_type == 0 ? "BUY " : "SELL";
+      string row = StringFormat("%02d    %s  %-10s  %6.2f  %11.5f  %+10.2f  %I64u",
+                                i + 1,
+                                direction,
+                                g_sources[i].symbol,
+                                g_sources[i].volume,
+                                g_sources[i].open_price,
+                                estimated_profit,
+                                g_sources[i].source_id);
+      PanelSetLabel(suffix, row, estimated_profit >= 0.0 ? clrLimeGreen : clrTomato);
+   }
+
+   string title = "快照源单明细（显示 " + IntegerToString(MathMin(total, rows)) +
+                  "/" + IntegerToString(total) + "）";
+   if(total > rows)
+      title += "  其余 " + IntegerToString(total - rows) + " 单未展开";
+   PanelSetLabel("SOURCE_TITLE", title, clrDeepSkyBlue);
 }
 
 void PanelUpdate(const bool force)
@@ -1115,6 +1170,7 @@ void PanelUpdate(const bool force)
    PanelSetButton("BTN_PAUSE",
                   PanelEntriesPaused() ? "恢复新开" : "暂停新开",
                   PanelEntriesPaused() ? C'42,134,88' : C'184,117,22');
+   PanelUpdateSourceRows();
    ChartRedraw(0);
 }
 
@@ -1229,6 +1285,9 @@ void CheckPositions()
       CloseCopiesWithoutSource();
       DeletePendingsWithoutSource();
    }
+
+   if(fresh)
+      CleanupFinishedCopyState();
 
    if(fresh)
    {
@@ -1471,6 +1530,7 @@ void CopyTotalLossSources(const SourceProfile& profile,
          continue;
 
       double volume = CalculateCopyVolume(local_symbol, source.volume, profile, 1);
+      volume = PartialRetryVolume(local_symbol, source_ticket, 1, volume);
       if(volume <= 0.0)
       {
          PrintFormat("Skip total-loss source #%I64u: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f",
@@ -1656,6 +1716,7 @@ void CopyGridSources(const SourceProfile& profile,
 
       double source_volume = source.volume;
       double volume = CalculateCopyVolume(local_symbol, source_volume, profile, 1);
+      volume = PartialRetryVolume(local_symbol, source_ticket, 1, volume);
       if(volume <= 0.0)
       {
          PrintFormat("Skip grid source #%I64u: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f fixed_lot=%.8f min=%.8f max=%.8f step=%.8f",
@@ -1762,6 +1823,7 @@ void ProcessSourceLevel(const FileSourcePosition& source, const SourceProfile& p
 
    double source_volume = source.volume;
    double volume = CalculateCopyVolume(symbol, source_volume, profile, level_index);
+   volume = PartialRetryVolume(symbol, source_ticket, level_index, volume);
    if(volume <= 0.0)
    {
       PrintFormat("Skip source #%I64u L%d: calculated copy volume is invalid. source_symbol=%s local_symbol=%s source_volume=%.8f fixed_lot=%.8f min=%.8f max=%.8f step=%.8f",
@@ -2624,7 +2686,7 @@ void UpdateRoundCopyTracking()
 
 string GridStatePrefix(const string state)
 {
-   return g_prefix + "GRID_" + state + "_" + IntegerToString((long)InpCopyMagic) + "_";
+   return g_prefix + "GRID_" + state + "_";
 }
 
 string GridGroupStateName(const string state,
@@ -2665,7 +2727,7 @@ void SetGridGroupStopped(const int profile_index, const string symbol, const ENU
 
 string TotalLossStatePrefix(const string state)
 {
-   return g_prefix + "TOTAL_" + state + "_" + IntegerToString((long)InpCopyMagic) + "_";
+   return g_prefix + "TOTAL_" + state + "_";
 }
 
 string TotalLossGroupStateName(const string state, const int profile_index, const string symbol)
@@ -2819,6 +2881,72 @@ void AddString(string &values[], const string value)
    values[total] = value;
 }
 
+bool HasLiveCopyOrPendingForSourceLevel(const ulong source_ticket, const int level_index)
+{
+   string expected_comment = CopyComment(source_ticket, level_index);
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if((ulong)magic != InpCopyMagic && magic != 0)
+         continue;
+      if(PositionGetString(POSITION_COMMENT) == expected_comment)
+         return true;
+      if(SourceTicketFromCurrentPosition() == source_ticket &&
+         CopyLevelFromCurrentPosition() == level_index)
+         return true;
+   }
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong order_ticket = OrderGetTicket(i);
+      if(order_ticket == 0 || !OrderSelect(order_ticket))
+         continue;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) != InpCopyMagic)
+         continue;
+      if(OrderGetString(ORDER_COMMENT) == expected_comment)
+         return true;
+   }
+   return false;
+}
+
+void CleanupFinishedCopyState()
+{
+   if(!g_snapshot_fresh)
+      return;
+   if(g_prefix == "")
+      return;
+
+   int total = GlobalVariablesTotal();
+   int prefix_length = StringLen(g_prefix);
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, g_prefix) != 0)
+         continue;
+
+      string tail = StringSubstr(name, prefix_length);
+      bool partial = StringFind(tail, "PARTIAL_") == 0;
+      string source_text = partial ? StringSubstr(tail, StringLen("PARTIAL_")) : tail;
+      int level_separator = StringFind(source_text, "_L");
+      if(level_separator <= 0)
+         continue;
+
+      ulong source_ticket = (ulong)StringToInteger(StringSubstr(source_text, 0, level_separator));
+      int level_index = (int)StringToInteger(StringSubstr(source_text, level_separator + 2));
+      if(source_ticket == 0 || level_index < 1 || level_index > 3)
+         continue;
+      if(FileSourceExists(source_ticket))
+         continue;
+      if(HasLiveCopyOrPendingForSourceLevel(source_ticket, level_index))
+         continue;
+      GlobalVariableDel(name);
+   }
+}
+
 void CloseCopiesWithoutSource()
 {
    int total = PositionsTotal();
@@ -2836,13 +2964,72 @@ void CloseCopiesWithoutSource()
          continue;
 
       if(FileSourceExists(source_ticket))
+      {
+         ClearMissingSourceConfirmation(copy_ticket);
+         continue;
+      }
+
+      if(!ConfirmSourceMissing(copy_ticket, source_ticket))
          continue;
 
       if(IsCloseRetryCoolingDown(copy_ticket))
          continue;
 
-      CloseCopyPosition(copy_ticket, source_ticket);
+      if(CloseCopyPosition(copy_ticket, source_ticket))
+         ClearMissingSourceConfirmation(copy_ticket);
    }
+}
+
+int MissingSourceConfirmationIndex(const ulong copy_ticket)
+{
+   for(int i = 0; i < ArraySize(g_missing_source_confirmations); i++)
+      if(g_missing_source_confirmations[i].copy_ticket == copy_ticket)
+         return i;
+   return -1;
+}
+
+void ClearMissingSourceConfirmation(const ulong copy_ticket)
+{
+   int index = MissingSourceConfirmationIndex(copy_ticket);
+   if(index < 0)
+      return;
+   int last = ArraySize(g_missing_source_confirmations) - 1;
+   if(index != last)
+      g_missing_source_confirmations[index] = g_missing_source_confirmations[last];
+   ArrayResize(g_missing_source_confirmations, last);
+}
+
+bool ConfirmSourceMissing(const ulong copy_ticket, const ulong source_id)
+{
+   int index = MissingSourceConfirmationIndex(copy_ticket);
+   if(index < 0)
+   {
+      int total = ArraySize(g_missing_source_confirmations);
+      ArrayResize(g_missing_source_confirmations, total + 1);
+      index = total;
+      g_missing_source_confirmations[index].copy_ticket = copy_ticket;
+      g_missing_source_confirmations[index].source_id = source_id;
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots = 1;
+      return false;
+   }
+
+   if(g_missing_source_confirmations[index].source_id != source_id)
+   {
+      g_missing_source_confirmations[index].source_id = source_id;
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots = 1;
+      return false;
+   }
+
+   if(g_missing_source_confirmations[index].last_sequence != g_snapshot_sequence)
+   {
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots++;
+   }
+
+   int required = InpSourceCloseConfirmSnapshots < 2 ? 2 : InpSourceCloseConfirmSnapshots;
+   return g_missing_source_confirmations[index].missing_snapshots >= required;
 }
 
 void DeletePendingsWithoutSource()
@@ -2862,9 +3049,16 @@ void DeletePendingsWithoutSource()
          continue;
 
       if(FileSourceExists(source_ticket))
+      {
+         ClearMissingSourceConfirmation(order_ticket);
+         continue;
+      }
+
+      if(!ConfirmSourceMissing(order_ticket, source_ticket))
          continue;
 
-      DeleteCopyPending(order_ticket, source_ticket);
+      if(DeleteCopyPending(order_ticket, source_ticket))
+         ClearMissingSourceConfirmation(order_ticket);
    }
 }
 
@@ -2918,12 +3112,12 @@ ulong CurrentPositionIdentifier()
 
 string CopyPositionSourceMapName(const ulong position_identifier)
 {
-   return g_prefix + "P_SRC_" + IntegerToString((long)InpCopyMagic) + "_" + IntegerToString((long)position_identifier);
+   return g_prefix + "P_SRC_" + IntegerToString((long)position_identifier);
 }
 
 string CopyPositionLevelMapName(const ulong position_identifier)
 {
-   return g_prefix + "P_LVL_" + IntegerToString((long)InpCopyMagic) + "_" + IntegerToString((long)position_identifier);
+   return g_prefix + "P_LVL_" + IntegerToString((long)position_identifier);
 }
 
 void RememberCopyPositionMapping(const ulong source_ticket, const int level_index)
@@ -2938,6 +3132,25 @@ void RememberCopyPositionMapping(const ulong source_ticket, const int level_inde
    GlobalVariableSet(CopyPositionSourceMapName(position_identifier), (double)source_ticket);
    if(level_index > 0)
       GlobalVariableSet(CopyPositionLevelMapName(position_identifier), (double)level_index);
+}
+
+void RememberCopyPositionMappingByIdentifier(const ulong position_identifier,
+                                             const ulong source_ticket,
+                                             const int level_index)
+{
+   if(position_identifier == 0 || source_ticket == 0)
+      return;
+   GlobalVariableSet(CopyPositionSourceMapName(position_identifier), (double)source_ticket);
+   if(level_index > 0)
+      GlobalVariableSet(CopyPositionLevelMapName(position_identifier), (double)level_index);
+}
+
+void ForgetCopyPositionMapping(const ulong position_identifier)
+{
+   if(position_identifier == 0)
+      return;
+   GlobalVariableDel(CopyPositionSourceMapName(position_identifier));
+   GlobalVariableDel(CopyPositionLevelMapName(position_identifier));
 }
 
 ulong SourceTicketFromCurrentPosition()
@@ -3182,18 +3395,25 @@ bool PlaceCopyPending(const ulong source_ticket,
    request.magic = InpCopyMagic;
    request.comment = CopyComment(source_ticket, level_index);
    request.type_time = ORDER_TIME_GTC;
-   request.type_filling = GetFillingType(symbol);
+   request.type_filling = ORDER_FILLING_RETURN;
 
    ApplyStops(request, position_type, trigger_price, source_sl, source_tp, point, digits, profile, level_index);
 
    ResetLastError();
    bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(!sent || !IsPendingPlacementRetcode(result.retcode))
    {
       PrintFormat("Pending copy failed. source=%I64u symbol=%s volume=%.8f price=%.5f retcode=%u last_error=%d comment=%s",
                   source_ticket, symbol, volume, trigger_price, result.retcode, GetLastError(), result.comment);
       return false;
    }
+
+   ulong position_identifier = 0;
+   if(result.deal > 0 && HistoryDealSelect(result.deal))
+      position_identifier = (ulong)HistoryDealGetInteger(result.deal, DEAL_POSITION_ID);
+   if(position_identifier == 0)
+      position_identifier = result.order;
+   RememberCopyPositionMappingByIdentifier(position_identifier, source_ticket, level_index);
 
    if(InpPrintDebug)
    {
@@ -3294,12 +3514,41 @@ bool OpenCopyTrade(const ulong source_ticket,
 
    ResetLastError();
    bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+   {
+      double remaining = volume - result.volume;
+      double retry_volume = NormalizeVolume(symbol, remaining);
+      if(retry_volume > 0.0 &&
+         retry_volume < volume &&
+         retry_volume <= remaining + SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP) * 0.01)
+      {
+         GlobalVariableSet(PartialCopyGlobalName(source_ticket, level_index), retry_volume);
+         PrintFormat("Copy partially filled; residual will be retried. source=%I64u level=L%d requested=%.8f filled=%.8f remaining=%.8f",
+                     source_ticket, level_index, volume, result.volume, retry_volume);
+      }
+      else
+      {
+         GlobalVariableDel(PartialCopyGlobalName(source_ticket, level_index));
+         PrintFormat("Copy partial fill has no valid residual volume. source=%I64u level=L%d requested=%.8f filled=%.8f",
+                     source_ticket, level_index, volume, result.volume);
+      }
+      return false;
+   }
+
+   if(!sent || !IsDealCompleteRetcode(result.retcode))
    {
       PrintFormat("Copy failed. source=%I64u symbol=%s volume=%.8f retcode=%u last_error=%d comment=%s",
                   source_ticket, symbol, volume, result.retcode, GetLastError(), result.comment);
       return false;
    }
+
+   ulong position_identifier = 0;
+   if(result.deal > 0 && HistoryDealSelect(result.deal))
+      position_identifier = (ulong)HistoryDealGetInteger(result.deal, DEAL_POSITION_ID);
+   if(position_identifier == 0)
+      position_identifier = result.order;
+   RememberCopyPositionMappingByIdentifier(position_identifier, source_ticket, level_index);
+   GlobalVariableDel(PartialCopyGlobalName(source_ticket, level_index));
 
    if(InpPrintDebug)
    {
@@ -3332,7 +3581,7 @@ bool DeleteCopyPending(const ulong order_ticket, const ulong source_ticket)
 
    ResetLastError();
    bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(!sent || !IsRemoveCompleteRetcode(result.retcode))
    {
       PrintFormat("Delete pending failed. order=%I64u source=%I64u retcode=%u last_error=%d comment=%s",
                   order_ticket, source_ticket, result.retcode, GetLastError(), result.comment);
@@ -3353,6 +3602,8 @@ bool CloseCopyPosition(const ulong copy_ticket, const ulong source_ticket)
    string symbol = PositionGetString(POSITION_SYMBOL);
    ENUM_POSITION_TYPE position_type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
    double volume = PositionGetDouble(POSITION_VOLUME);
+   ulong position_identifier = CurrentPositionIdentifier();
+   int level_index = CopyLevelFromCurrentPosition();
 
    int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
    double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
@@ -3379,7 +3630,14 @@ bool CloseCopyPosition(const ulong copy_ticket, const ulong source_ticket)
    MarkCloseAttempt(copy_ticket);
    ResetLastError();
    bool sent = OrderSend(request, result);
-   if(!sent || !IsSuccessRetcode(result.retcode))
+   if(result.retcode == TRADE_RETCODE_DONE_PARTIAL)
+   {
+      PrintFormat("Close partially filled; residual will be retried. copy=%I64u source=%I64u requested=%.8f filled=%.8f",
+                  copy_ticket, source_ticket, volume, result.volume);
+      return false;
+   }
+
+   if(!sent || !IsDealCompleteRetcode(result.retcode))
    {
       PrintFormat("Close copy failed. copy=%I64u source=%I64u symbol=%s volume=%.8f retcode=%u last_error=%d comment=%s",
                   copy_ticket, source_ticket, symbol, volume, result.retcode, GetLastError(), result.comment);
@@ -3392,6 +3650,10 @@ bool CloseCopyPosition(const ulong copy_ticket, const ulong source_ticket)
                   copy_ticket, source_ticket, result.order, result.deal, symbol, volume);
    }
 
+   ForgetCopyPositionMapping(position_identifier);
+   GlobalVariableDel(CloseAttemptGlobalName(copy_ticket));
+   if(level_index > 0 && !FileSourceExists(source_ticket))
+      GlobalVariableDel(CopyGlobalName(source_ticket, level_index));
    return true;
 }
 
@@ -3412,7 +3674,7 @@ void MarkCloseAttempt(const ulong copy_ticket)
 
 string CloseAttemptGlobalName(const ulong copy_ticket)
 {
-   return g_prefix + "CLOSING_" + IntegerToString((long)InpCopyMagic) + "_" + IntegerToString((long)copy_ticket);
+   return g_prefix + "CLOSING_" + IntegerToString((long)copy_ticket);
 }
 
 ENUM_ORDER_TYPE_FILLING GetFillingType(const string symbol)
@@ -3428,11 +3690,20 @@ ENUM_ORDER_TYPE_FILLING GetFillingType(const string symbol)
    return ORDER_FILLING_RETURN;
 }
 
-bool IsSuccessRetcode(const uint retcode)
+bool IsPendingPlacementRetcode(const uint retcode)
 {
    return retcode == TRADE_RETCODE_DONE ||
-          retcode == TRADE_RETCODE_DONE_PARTIAL ||
           retcode == TRADE_RETCODE_PLACED;
+}
+
+bool IsDealCompleteRetcode(const uint retcode)
+{
+   return retcode == TRADE_RETCODE_DONE;
+}
+
+bool IsRemoveCompleteRetcode(const uint retcode)
+{
+   return retcode == TRADE_RETCODE_DONE;
 }
 
 bool IsAllowedSymbol(string symbol, string allowed)
@@ -3461,11 +3732,41 @@ string CopyComment(const ulong source_ticket, const int level_index)
 
 string CopyGlobalName(const ulong source_ticket, const int level_index)
 {
-   return g_prefix + IntegerToString((long)InpCopyMagic) + "_" + IntegerToString((long)source_ticket) + "_L" + IntegerToString(level_index);
+   return g_prefix + IntegerToString((long)source_ticket) + "_L" + IntegerToString(level_index);
 }
 
+string PartialCopyGlobalName(const ulong source_ticket, const int level_index)
+{
+   return g_prefix + "PARTIAL_" + IntegerToString((long)source_ticket) + "_L" + IntegerToString(level_index);
+}
+
+double PartialRetryVolume(const string symbol,
+                          const ulong source_ticket,
+                          const int level_index,
+                          const double calculated_volume)
+{
+   if(calculated_volume <= 0.0)
+      return calculated_volume;
+
+   string name = PartialCopyGlobalName(source_ticket, level_index);
+   if(!GlobalVariableCheck(name))
+      return calculated_volume;
+
+   double remaining = GlobalVariableGet(name);
+   if(remaining <= 0.0)
+   {
+      GlobalVariableDel(name);
+      return calculated_volume;
+   }
+
+   return NormalizeVolume(symbol, MathMin(calculated_volume, remaining));
+}
 bool IsAlreadyCopied(const ulong source_ticket, const int level_index)
 {
+   // A partial market fill remains eligible for the residual retry.
+   if(GlobalVariableCheck(PartialCopyGlobalName(source_ticket, level_index)))
+      return false;
+
    string gv_name = CopyGlobalName(source_ticket, level_index);
    if(GlobalVariableCheck(gv_name))
       return true;
@@ -3771,6 +4072,17 @@ bool FileSourceExists(const ulong source_id)
 string SnapshotFileName()
 {
    return "FileLossFollow_" + SanitizeNamePart(InpChannelName) + ".tsv";
+}
+
+uint LossFollowNameHash(const string value)
+{
+   uint hash = 2166136261;
+   for(int i = 0; i < StringLen(value); i++)
+   {
+      hash ^= (uint)StringGetCharacter(value, i);
+      hash *= 16777619;
+   }
+   return hash;
 }
 
 string SanitizeNamePart(string value)
