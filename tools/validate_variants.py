@@ -346,6 +346,8 @@ def main() -> int:
     for token in ("RlfcMemoryBridge", "kernel32.dll", "CreateFileMappingW"):
         if token in file_snapshot:
             fail(f"file_snapshot: unexpected memory transport token {token}")
+    if "MemorySourceExists(" in file_snapshot:
+        fail("file_snapshot: memory source lookup leaked into file transport")
     file_trade_event = extract_function(file_snapshot, "OnTradeTransaction")
     if "InpFileRole == FILE_FOLLOW_SENDER" not in file_trade_event:
         fail("file_snapshot: OnTradeTransaction must use the file-role selector")
@@ -368,6 +370,17 @@ def main() -> int:
     if (ROOT / "LossFollowPanel.mq5").exists():
         fail("panel must stay embedded; standalone LossFollowPanel.mq5 found")
     for name, source in sources.items():
+        if "CheckPositions();" in extract_function(source, "OnTick"):
+            fail(f"{name}: receiver full scan must be timer-driven, not quote-driven")
+        if "RememberCopyPositionMappingByIdentifier" not in extract_function(source, "OpenCopyTrade"):
+            fail(f"{name}: market copy must persist source mapping immediately after execution")
+        for token in ("InpPanelSourceRows", "PanelUpdateSourceRows", "SOURCE_ROW_"):
+            if token not in source:
+                fail(f"{name}: snapshot source-order visualization missing token {token}")
+        if "ConfirmSourceMissing" not in extract_function(source, "CloseCopiesWithoutSource"):
+            fail(f"{name}: source close must be confirmed across snapshot sequences")
+        if "ConfirmSourceMissing" not in extract_function(source, "DeletePendingsWithoutSource"):
+            fail(f"{name}: pending deletion must be confirmed across snapshot sequences")
         for token in ("InpShowPanel", "OBJ_RECTANGLE_LABEL", "OBJ_BUTTON", "PanelEntriesPaused"):
             if token not in source:
                 fail(f"{name}: embedded panel token missing: {token}")

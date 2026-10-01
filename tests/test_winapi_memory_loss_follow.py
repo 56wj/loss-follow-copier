@@ -2,6 +2,8 @@ import re
 import unittest
 from pathlib import Path
 
+from test_loss_follow_variants import code_only
+
 
 SOURCE = Path(__file__).resolve().parents[1] / "WinApiMemoryLossFollow.mq5"
 
@@ -71,8 +73,9 @@ class WinApiMemoryLossFollowSourceTests(unittest.TestCase):
         self.assertIn("HasLiveCopyOrPendingForSourceLevel", cleanup)
 
     def test_source_balances_and_no_duplicate_function_definitions(self):
-        self.assertEqual(self.source.count("{"), self.source.count("}"))
-        self.assertEqual(self.source.count("("), self.source.count(")"))
+        stripped = code_only(self.source)
+        self.assertEqual(stripped.count("{"), stripped.count("}"))
+        self.assertEqual(stripped.count("("), stripped.count(")"))
         definitions = re.findall(
             r"(?m)^\s*(?:bool|void|int|uint|long|ulong|double|string|datetime|ENUM_[A-Z0-9_]+)\s+([A-Za-z_]\w*)\s*\(",
             self.source,

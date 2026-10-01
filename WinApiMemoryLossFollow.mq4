@@ -3,7 +3,7 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.04"
+#property version   "1.09"
 #property description "MT4 Windows API共享内存跟单：兼容MT5通道，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
@@ -180,6 +180,7 @@ input bool               InpSenderPauseWhenAutoTradingOff = true;           // �
 
 //--- group "接收端设置（仅Receiver角色）"
 input int                InpSourceStaleMilliseconds = 3000;                 // 超时后停止新开单及源单同步平仓
+input int                InpSourceCloseConfirmSnapshots = 2;                // 连续多少个新快照缺少源单才同步平仓，防止成交瞬间竞态
 
 //--- group "源EA1设置"
 input bool               InpEA1Enabled           = true;         // 启用源EA1
@@ -289,6 +290,7 @@ input ENUM_BASE_CORNER   InpPanelCorner          = CORNER_LEFT_UPPER; // 面板�
 input int                InpPanelX               = 10;           // 面板水平偏移
 input int                InpPanelY               = 20;           // 面板垂直偏移
 input int                InpPanelRefreshMs       = 250;          // 面板刷新周期，最低100毫秒
+input int                InpPanelSourceRows      = 8;            // 面板显示的快照源单明细行数，范围1~12
 
 string g_prefix;
 int g_memory_capacity_bytes = 0;
@@ -308,6 +310,15 @@ datetime g_snapshot_time = 0;
 bool g_have_snapshot = false;
 bool g_snapshot_fresh = false;
 ulong g_snapshot_sequence = 0;
+
+struct MissingSourceConfirmation
+{
+   ulong copy_ticket;
+   ulong source_id;
+   ulong last_sequence;
+   int   missing_snapshots;
+};
+MissingSourceConfirmation g_missing_source_confirmations[];
 ulong g_snapshot_publish_tick_ms = 0;
 ulong g_last_memory_read_tick_ms = 0;
 datetime g_last_memory_error_log = 0;
@@ -322,6 +333,9 @@ string g_panel_last_action = "就绪";
 string g_round_copy_keys[];
 int g_round_copy_counts[];
 bool g_round_copy_tracking_ready = false;
+bool g_reset_blocked = false;
+bool g_reset_waiting_snapshot = false;
+ulong g_reset_snapshot_sequence = 0;
 ulong g_sender_sequence = 0;
 datetime g_last_debug_print = 0;
 datetime g_last_error_print = 0;
@@ -1299,6 +1313,9 @@ int InitMemoryReceiver()
       return INIT_FAILED;
    }
 
+   g_reset_blocked = GlobalVariableCheck(ResetBlockGlobalName());
+   if(g_reset_blocked)
+      g_panel_last_action = "上次状态更新未完成，已停开，请空仓后再次更新";
    PanelInitialize();
    LoadMemorySnapshot(true);
    UpdateRoundCopyTracking();
@@ -1317,8 +1334,8 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   if(InpMemoryRole == MEMORY_FOLLOW_RECEIVER)
-      CheckPositions();
+   // Receiver synchronization is timer-driven. Running the full scan on every quote
+   // duplicates work on high-tick symbols and can make the terminal UI stutter.
 }
 
 void OnTimer()
@@ -1670,8 +1687,8 @@ void PanelInitialize()
 
    int x = InpPanelX;
    int y = InpPanelY;
-   PanelCreateBackground("BG", x, y, 390, 305, C'24,29,38', C'62,77,98');
-   PanelCreateBackground("HEADER_BG", x + 1, y + 1, 388, 34, C'35,94,150', C'35,94,150');
+   PanelCreateBackground("BG", x, y, 540, 570, C'24,29,38', C'62,77,98');
+   PanelCreateBackground("HEADER_BG", x + 1, y + 1, 538, 34, C'35,94,150', C'35,94,150');
    PanelCreateLabel("TITLE", x + 14, y + 8, "LOSS FOLLOW  跟单控制面板", clrWhite, 11);
    PanelCreateLabel("TRANSPORT", x + 14, y + 43, "传输：--", clrSilver);
    PanelCreateLabel("ACCOUNT", x + 14, y + 64, "账户：--", clrSilver);
@@ -1685,7 +1702,15 @@ void PanelInitialize()
    PanelCreateButton("BTN_PAUSE", x + 12, y + 238, 112, 30, "暂停新开", C'184,117,22');
    PanelCreateButton("BTN_CLOSE", x + 139, y + 238, 112, 30, "全部平仓", C'161,52,58');
    PanelCreateButton("BTN_DELETE", x + 266, y + 238, 112, 30, "删除挂单", C'115,68,143');
+   PanelCreateButton("BTN_RESET", x + 393, y + 238, 134, 30, "更新跟单", C'35,94,150');
+   ObjectSetString(0, PanelObjectName("BTN_RESET"), OBJPROP_TOOLTIP,
+                   "仅空仓且无挂单时可更新；清除已跟记录，符合条件的旧源单可能立即重新跟单");
    PanelCreateLabel("ACTION", x + 14, y + 278, "操作：就绪", clrDarkGray, 8);
+   PanelCreateLabel("SOURCE_TITLE", x + 14, y + 310, "快照源单明细（当前接收数据）", clrDeepSkyBlue, 9);
+   PanelCreateLabel("SOURCE_HEAD", x + 14, y + 331, "序号  方向  品种       手数     开仓价       估算盈亏      源单ID", clrSilver, 8);
+   int source_rows = InpPanelSourceRows < 1 ? 1 : (InpPanelSourceRows > 12 ? 12 : InpPanelSourceRows);
+   for(int i = 0; i < source_rows; i++)
+      PanelCreateLabel("SOURCE_ROW_" + IntegerToString(i), x + 14, y + 352 + i * 17, "", clrSilver, 8);
    PanelUpdate(true);
 }
 
@@ -1740,6 +1765,43 @@ void PanelCollectCopyStats(int &position_count,
          continue;
       pending_count++;
    }
+}
+
+void PanelUpdateSourceRows()
+{
+   int rows = InpPanelSourceRows < 1 ? 1 : (InpPanelSourceRows > 12 ? 12 : InpPanelSourceRows);
+   int total = ArraySize(g_sources);
+   for(int i = 0; i < rows; i++)
+   {
+      string suffix = "SOURCE_ROW_" + IntegerToString(i);
+      if(i >= total)
+      {
+         PanelSetLabel(suffix, i == 0 ? "（当前快照没有源单）" : "", clrDarkGray);
+         continue;
+      }
+
+      string local_symbol = LocalSymbolForSource(g_sources[i].symbol);
+      double estimated_profit = SourcePositionProfitMoney(local_symbol,
+                                                          g_sources[i].position_type,
+                                                          g_sources[i].open_price,
+                                                          g_sources[i].volume);
+      string direction = (int)g_sources[i].position_type == 0 ? "BUY " : "SELL";
+      string row = StringFormat("%02d    %s  %-10s  %6.2f  %11.5f  %+10.2f  %I64u",
+                                i + 1,
+                                direction,
+                                g_sources[i].symbol,
+                                g_sources[i].volume,
+                                g_sources[i].open_price,
+                                estimated_profit,
+                                g_sources[i].source_id);
+      PanelSetLabel(suffix, row, estimated_profit >= 0.0 ? clrLimeGreen : clrTomato);
+   }
+
+   string title = "快照源单明细（显示 " + IntegerToString(MathMin(total, rows)) +
+                  "/" + IntegerToString(total) + "）";
+   if(total > rows)
+      title += "  其余 " + IntegerToString(total - rows) + " 单未展开";
+   PanelSetLabel("SOURCE_TITLE", title, clrDeepSkyBlue);
 }
 
 void PanelUpdate(const bool force)
@@ -1806,9 +1868,12 @@ void PanelUpdate(const bool force)
    PanelSetLabel("TRADE",
                  "自动交易：" + (IsAlgoTradingAllowed() ? "已开启" : "已关闭"),
                  IsAlgoTradingAllowed() ? clrLimeGreen : clrTomato);
-   PanelSetLabel("PAUSE",
-                 "新开控制：" + (PanelEntriesPaused() ? "已暂停（平仓逻辑继续）" : "正常跟单"),
-                 PanelEntriesPaused() ? clrOrange : clrLimeGreen);
+   string entry_status = g_reset_blocked ? "状态更新未完成（停开）" :
+                         (PanelEntriesPaused() ? "已暂停（平仓逻辑继续）" :
+                         (g_reset_waiting_snapshot ? "更新后等待新快照" : "正常跟单"));
+   PanelSetLabel("PAUSE", "新开控制：" + entry_status,
+                 g_reset_blocked || PanelEntriesPaused() || g_reset_waiting_snapshot
+                 ? clrOrange : clrLimeGreen);
    PanelSetLabel("ACTION", "操作：" + g_panel_last_action, clrDarkGray);
 
    if(g_panel_confirm_action == "CLOSE")
@@ -1821,9 +1886,14 @@ void PanelUpdate(const bool force)
    else
       PanelSetButton("BTN_DELETE", "删除挂单", C'115,68,143');
 
+   PanelSetButton("BTN_RESET",
+                  g_panel_confirm_action == "RESET" ? "再次点击确认" : "更新跟单",
+                  g_panel_confirm_action == "RESET" ? C'184,117,22' : C'35,94,150');
+
    PanelSetButton("BTN_PAUSE",
                   PanelEntriesPaused() ? "恢复新开" : "暂停新开",
                   PanelEntriesPaused() ? C'42,134,88' : C'184,117,22');
+   PanelUpdateSourceRows();
    ChartRedraw(0);
 }
 
@@ -1841,8 +1911,219 @@ bool PanelConfirmAction(const string action)
    g_panel_confirm_until_tick_ms = now_tick + 3000;
    g_panel_last_action = action == "CLOSE"
                          ? "3秒内再次点击“全部平仓”确认"
-                         : "3秒内再次点击“删除挂单”确认";
+                         : (action == "RESET"
+                            ? "3秒内再次点击“更新跟单”；旧源单可能立即重新跟单"
+                            : "3秒内再次点击“删除挂单”确认");
    return false;
+}
+
+// Reset touches only cycle state owned by this receiver; position mappings are retained.
+string ResetBlockGlobalName()
+{
+   return "WMLFC_RESET_" + IntegerToString((long)WinApiMemoryNameHash(
+      IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "|" +
+      InpChannelName + "|" + IntegerToString((long)InpCopyMagic)));
+}
+
+bool BlockEntriesForStateChange()
+{
+   g_reset_blocked = true;
+   if(GlobalVariableSet(ResetBlockGlobalName(), 1.0) == 0)
+   {
+      g_panel_last_action = "无法保存停开状态，更新未执行";
+      Print(g_panel_last_action);
+      return false;
+   }
+   GlobalVariablesFlush();
+   return true;
+}
+
+bool IsNumericStateId(const string value)
+{
+   if(StringLen(value) == 0)
+      return false;
+   for(int i = 0; i < StringLen(value); i++)
+   {
+      ushort c = StringGetCharacter(value, i);
+      if(c < '0' || c > '9')
+         return false;
+   }
+   return true;
+}
+
+bool IsCopyLevelStateTail(const string tail)
+{
+   int separator = StringFind(tail, "_L");
+   if(separator <= 0 || !IsNumericStateId(StringSubstr(tail, 0, separator)))
+      return false;
+   string level = StringSubstr(tail, separator + 2);
+   return level == "1" || level == "2" || level == "3" || level == "1_INIT";
+}
+
+bool IsReceiverCycleState(const string name)
+{
+   if(g_prefix == "" || StringFind(name, g_prefix) != 0)
+      return false;
+   if(StringFind(name, GridStatePrefix("A")) == 0 ||
+      StringFind(name, GridStatePrefix("S")) == 0 ||
+      StringFind(name, TotalLossStatePrefix("A")) == 0 ||
+      StringFind(name, TotalLossStatePrefix("S")) == 0)
+      return true;
+   // MT4's g_prefix is shared by different Magic values. Match the full key scope.
+   string copy_prefix = g_prefix + IntegerToString((long)InpCopyMagic) + "_";
+   if(StringFind(name, copy_prefix) != 0)
+      return false;
+   return IsCopyLevelStateTail(StringSubstr(name, StringLen(copy_prefix)));
+}
+
+bool ResetHasCopyExposure()
+{
+   M4InvalidateTradeCache();
+   for(int i = M4PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = M4PositionGetTicket(i);
+      if(ticket == 0 || !M4PositionSelectByTicket(ticket))
+         return true;
+      if((ulong)M4PositionGetInteger(M4_POSITION_MAGIC) == InpCopyMagic || IsCopyPosition())
+         return true;
+   }
+   for(int i = M4PendingOrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = M4PendingOrderGetTicket(i);
+      if(ticket == 0 || !M4PendingOrderSelectByTicket(ticket))
+         return true;
+      if((ulong)M4PendingOrderGetInteger(M4_ORDER_MAGIC) == InpCopyMagic)
+         return true;
+   }
+   return false;
+}
+
+void PanelResetFollowing()
+{
+   // Recheck on the confirmed click. Never close positions or remove orders here.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+   {
+      g_panel_last_action = "更新未执行：交易终端未连接";
+      return;
+   }
+   if(ResetHasCopyExposure())
+   {
+      g_panel_last_action = "更新未执行：请先清空本EA持仓和挂单";
+      return;
+   }
+   if(!LoadMemorySnapshot(true))
+   {
+      g_panel_last_action = "更新未执行：源端快照不可用或已暂停";
+      return;
+   }
+   if(!BlockEntriesForStateChange())
+      return;
+
+   int removed = 0;
+   int failed = 0;
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      if(!IsReceiverCycleState(name))
+         continue;
+      if(GlobalVariableDel(name))
+         removed++;
+      else
+         failed++;
+   }
+   GlobalVariablesFlush();
+
+   // An interrupted/failed reset remains blocked across EA restarts.
+   if(failed > 0)
+   {
+      g_panel_last_action = "更新失败：状态清理不完整，已停开，请再次更新";
+      PrintFormat("Following reset incomplete. removed=%d failed=%d", removed, failed);
+      return;
+   }
+
+   ArrayResize(g_round_copy_keys, 0);
+   ArrayResize(g_round_copy_counts, 0);
+   g_round_copy_tracking_ready = false;
+   ArrayResize(g_missing_source_confirmations, 0);
+   g_last_first_entry_time_filter_log = 0;
+   UpdateRoundCopyTracking();
+
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) ||
+      ResetHasCopyExposure() || !LoadMemorySnapshot(true))
+   {
+      g_panel_last_action = "状态已清理，但复核未通过，已停开，请再次更新";
+      return;
+   }
+   if(!GlobalVariableDel(ResetBlockGlobalName()))
+   {
+      g_panel_last_action = "更新失败：无法解除停开状态，请再次更新";
+      return;
+   }
+   GlobalVariablesFlush();
+   g_reset_blocked = false;
+   g_reset_snapshot_sequence = g_snapshot_sequence;
+   g_reset_waiting_snapshot = true;
+   g_panel_last_action = g_panel_entries_paused
+                         ? "更新完成，保持暂停；恢复新开后重新判断源单"
+                         : "更新完成，等待新快照；满足条件将重新跟单";
+   PrintFormat("Following reset completed. channel=%s magic=%I64u removed=%d paused=%s",
+               InpChannelName, (ulong)InpCopyMagic, removed,
+               g_panel_entries_paused ? "true" : "false");
+}
+
+string GridInitialSourceName(const ulong source_ticket)
+{
+   return CopyGlobalName(source_ticket, 1) + "_INIT";
+}
+
+bool IsGridInitialSourceSkipped(const ulong source_ticket)
+{
+   string name = GridInitialSourceName(source_ticket);
+   return GlobalVariableCheck(name) && GlobalVariableGet(name) < 0.5;
+}
+
+// Reserve the initial source set BEFORE sending any order. Failures retry the
+// same selected sources; later arrivals (without a decision) remain eligible.
+bool PrepareGridInitialSources(const SourceProfile& profile,
+                               const string symbol,
+                               const ENUM_M4_POSITION_TYPE position_type)
+{
+   int selected = 0;
+   for(int i = ArraySize(g_sources) - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type)
+         continue;
+      string name = GridInitialSourceName(source.source_id);
+      if((GlobalVariableCheck(name) && GlobalVariableGet(name) > 0.5) ||
+         IsAlreadyCopied(source.source_id, 1))
+         selected++;
+   }
+
+   for(int i = ArraySize(g_sources) - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type)
+         continue;
+      string name = GridInitialSourceName(source.source_id);
+      if(GlobalVariableCheck(name) || IsAlreadyCopied(source.source_id, 1))
+         continue;
+      bool eligible = profile.grid_initial_max_copies <= 0 ||
+                      selected < profile.grid_initial_max_copies;
+      if(GlobalVariableSet(name, eligible ? 1.0 : 0.0) == 0)
+      {
+         BlockEntriesForStateChange();
+         g_panel_last_action = "网格初始名单保存失败，已停开，请空仓后更新";
+         Print(g_panel_last_action);
+         return false;
+      }
+      if(eligible)
+         selected++;
+   }
+   GlobalVariablesFlush();
+   return true;
 }
 
 void PanelCloseAllCopies()
@@ -1917,6 +2198,11 @@ void PanelHandleChartEvent(const int event_id, const string object_name)
       if(PanelConfirmAction("CLOSE"))
          PanelCloseAllCopies();
    }
+   else if(object_name == PanelObjectName("BTN_RESET"))
+   {
+      if(PanelConfirmAction("RESET"))
+         PanelResetFollowing();
+   }
    else if(object_name == PanelObjectName("BTN_DELETE"))
    {
       if(PanelConfirmAction("DELETE"))
@@ -1931,6 +2217,8 @@ void PanelHandleChartEvent(const int event_id, const string object_name)
 void CheckPositions()
 {
    bool fresh = LoadMemorySnapshot(false);
+   if(g_reset_waiting_snapshot && fresh && g_snapshot_sequence != g_reset_snapshot_sequence)
+      g_reset_waiting_snapshot = false;
    PanelUpdate(false);
 
    if(InpCloseCopyWithSource && fresh)
@@ -1955,10 +2243,12 @@ void CheckPositions()
    if(!fresh)
       return;
 
-   if(PanelEntriesPaused())
+   if(g_reset_blocked || g_reset_waiting_snapshot || PanelEntriesPaused())
       return;
 
    CheckGridActivationEntries();
+   if(g_reset_blocked)
+      return;
    CheckTotalLossActivationEntries();
 
    int total = ArraySize(g_sources);
@@ -2019,6 +2309,8 @@ void CheckGridActivationEntries()
       AddString(processed_keys, key);
 
       ProcessGridGroup(profile, symbol, position_type);
+      if(g_reset_blocked)
+         return;
    }
 }
 
@@ -2255,6 +2547,8 @@ void ProcessGridGroup(const SourceProfile& profile,
          return;
       }
 
+      if(!PrepareGridInitialSources(profile, symbol, position_type))
+         return;
       SetGridGroupActive(profile.profile_index, symbol, position_type);
       if(InpPrintDebug)
       {
@@ -2267,11 +2561,11 @@ void ProcessGridGroup(const SourceProfile& profile,
                      loss_price);
       }
 
-      CopyGridSources(profile, symbol, local_symbol, position_type, true, loss_points, loss_price);
+      CopyGridSources(profile, symbol, local_symbol, position_type, loss_points, loss_price);
       return;
    }
 
-   CopyGridSources(profile, symbol, local_symbol, position_type, false, loss_points, loss_price);
+   CopyGridSources(profile, symbol, local_symbol, position_type, loss_points, loss_price);
 }
 
 bool SourceGroupStats(const SourceProfile& profile,
@@ -2329,11 +2623,9 @@ void CopyGridSources(const SourceProfile& profile,
                      const string symbol,
                      const string local_symbol,
                      const ENUM_M4_POSITION_TYPE position_type,
-                     const bool initial_activation,
                      const double group_loss_points,
                      const double group_loss_price)
 {
-   int copied_now = 0;
    int total = ArraySize(g_sources);
 
    for(int i = total - 1; i >= 0; i--)
@@ -2353,8 +2645,8 @@ void CopyGridSources(const SourceProfile& profile,
       if(IsAlreadyCopied(source_ticket, 1))
          continue;
 
-      if(initial_activation && profile.grid_initial_max_copies > 0 && copied_now >= profile.grid_initial_max_copies)
-         return;
+      if(IsGridInitialSourceSkipped(source_ticket))
+         continue;
 
       double source_volume = source.volume;
       double volume = CalculateCopyVolume(local_symbol, source_volume, profile, 1);
@@ -2381,10 +2673,7 @@ void CopyGridSources(const SourceProfile& profile,
       }
 
       if(OpenCopyTrade(source_ticket, local_symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
-      {
          MarkCopied(source_ticket, 1);
-         copied_now++;
-      }
    }
 }
 
@@ -3538,13 +3827,72 @@ void CloseCopiesWithoutSource()
          continue;
 
       if(MemorySourceExists(source_ticket))
+      {
+         ClearMissingSourceConfirmation(copy_ticket);
+         continue;
+      }
+
+      if(!ConfirmSourceMissing(copy_ticket, source_ticket))
          continue;
 
       if(IsCloseRetryCoolingDown(copy_ticket))
          continue;
 
-      CloseCopyPosition(copy_ticket, source_ticket);
+      if(CloseCopyPosition(copy_ticket, source_ticket))
+         ClearMissingSourceConfirmation(copy_ticket);
    }
+}
+
+int MissingSourceConfirmationIndex(const ulong copy_ticket)
+{
+   for(int i = 0; i < ArraySize(g_missing_source_confirmations); i++)
+      if(g_missing_source_confirmations[i].copy_ticket == copy_ticket)
+         return i;
+   return -1;
+}
+
+void ClearMissingSourceConfirmation(const ulong copy_ticket)
+{
+   int index = MissingSourceConfirmationIndex(copy_ticket);
+   if(index < 0)
+      return;
+   int last = ArraySize(g_missing_source_confirmations) - 1;
+   if(index != last)
+      g_missing_source_confirmations[index] = g_missing_source_confirmations[last];
+   ArrayResize(g_missing_source_confirmations, last);
+}
+
+bool ConfirmSourceMissing(const ulong copy_ticket, const ulong source_id)
+{
+   int index = MissingSourceConfirmationIndex(copy_ticket);
+   if(index < 0)
+   {
+      int total = ArraySize(g_missing_source_confirmations);
+      ArrayResize(g_missing_source_confirmations, total + 1);
+      index = total;
+      g_missing_source_confirmations[index].copy_ticket = copy_ticket;
+      g_missing_source_confirmations[index].source_id = source_id;
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots = 1;
+      return false;
+   }
+
+   if(g_missing_source_confirmations[index].source_id != source_id)
+   {
+      g_missing_source_confirmations[index].source_id = source_id;
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots = 1;
+      return false;
+   }
+
+   if(g_missing_source_confirmations[index].last_sequence != g_snapshot_sequence)
+   {
+      g_missing_source_confirmations[index].last_sequence = g_snapshot_sequence;
+      g_missing_source_confirmations[index].missing_snapshots++;
+   }
+
+   int required = InpSourceCloseConfirmSnapshots < 2 ? 2 : InpSourceCloseConfirmSnapshots;
+   return g_missing_source_confirmations[index].missing_snapshots >= required;
 }
 
 void DeletePendingsWithoutSource()
@@ -3564,9 +3912,16 @@ void DeletePendingsWithoutSource()
          continue;
 
       if(MemorySourceExists(source_ticket))
+      {
+         ClearMissingSourceConfirmation(order_ticket);
+         continue;
+      }
+
+      if(!ConfirmSourceMissing(order_ticket, source_ticket))
          continue;
 
-      DeleteCopyPending(order_ticket, source_ticket);
+      if(DeleteCopyPending(order_ticket, source_ticket))
+         ClearMissingSourceConfirmation(order_ticket);
    }
 }
 
@@ -3637,6 +3992,17 @@ void RememberCopyPositionMapping(const ulong source_ticket, const int level_inde
    if(position_identifier == 0)
       return;
 
+   GlobalVariableSet(CopyPositionSourceMapName(position_identifier), (double)source_ticket);
+   if(level_index > 0)
+      GlobalVariableSet(CopyPositionLevelMapName(position_identifier), (double)level_index);
+}
+
+void RememberCopyPositionMappingByIdentifier(const ulong position_identifier,
+                                             const ulong source_ticket,
+                                             const int level_index)
+{
+   if(position_identifier == 0 || source_ticket == 0)
+      return;
    GlobalVariableSet(CopyPositionSourceMapName(position_identifier), (double)source_ticket);
    if(level_index > 0)
       GlobalVariableSet(CopyPositionLevelMapName(position_identifier), (double)level_index);
@@ -3905,6 +4271,7 @@ bool PlaceCopyPending(const ulong source_ticket,
       return false;
    }
    M4InvalidateTradeCache();
+   RememberCopyPositionMappingByIdentifier((ulong)order_ticket, source_ticket, level_index);
 
    if(InpPrintDebug)
    {
@@ -4024,6 +4391,8 @@ bool OpenCopyTrade(const ulong source_ticket,
       return false;
    }
    M4InvalidateTradeCache();
+
+   RememberCopyPositionMappingByIdentifier((ulong)order_ticket, source_ticket, level_index);
 
    if(InpPrintDebug)
    {

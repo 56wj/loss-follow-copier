@@ -3,7 +3,7 @@
 //|  Shared memory via Windows kernel32; no custom DLL file.        |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "1.38"
+#property version   "1.39"
 #property description "Windows API共享内存跟单：统一角色切换，Receiver内嵌控制面板。"
 
 #import "kernel32.dll"
@@ -63,8 +63,9 @@ enum ENUM_COPY_ENTRY_MODE
 {
    ENTRY_MARKET_ON_TRIGGER = 0, // 持续监控，浮亏达到条件后市价入场
    ENTRY_PENDING_AT_TRIGGER = 1, // 源单出现后，在浮亏触发价提前挂单
-   ENTRY_GRID_ACTIVATION = 2,    // 单向网格激活: 按买/卖方向分别计算组合浮亏
-   ENTRY_TOTAL_FLOATING_LOSS = 3 // 净总浮亏激活: 买卖合并达到货币阈值后全跟，后续全跟
+   ENTRY_GRID_ACTIVATION = 2,    // 网格激活: 组合浮亏触发后补跟已有源单，后续新源单可直接跟
+   ENTRY_TOTAL_FLOATING_LOSS = 3, // 净总浮亏激活: 买卖合并达到货币阈值后全跟，后续全跟
+   ENTRY_GRID_SEED_FIRST = 4  // 首单先跟比例仓，达到浮亏点位后补齐首单，后续源单立即全跟
 };
 
 enum ENUM_COPY_DIRECTION_FILTER
@@ -124,6 +125,7 @@ struct SourceProfile
    double basket_profit_close_points;
    int grid_initial_max_copies;
    bool grid_stop_after_basket_close;
+   double grid_seed_percent;
    double total_loss_money;
 };
 
@@ -161,7 +163,7 @@ input int                InpSourceCloseConfirmSnapshots = 2;                // �
 
 input group "源EA1设置"
 input bool               InpEA1Enabled           = true;         // 启用源EA1
-input long               InpEA1Magic             = 123456;       // 源EA1魔术号，-1表示不限制魔术号
+input long               InpEA1Magic             = -1;       // 源EA1魔术号，-1表示不限制魔术号
 input string             InpEA1CommentFilter     = "";           // 源EA1注释模糊匹配，空表示不限制
 input string             InpEA1AllowedSymbols    = "";           // 源EA1允许品种，多个用;或,分隔，空表示全部
 input ENUM_COPY_ENTRY_MODE InpEA1EntryMode       = ENTRY_MARKET_ON_TRIGGER; // 源EA1入场模式
@@ -200,12 +202,13 @@ input int                InpEA1MinuteCloseEndSecond     = 0;     // 源EA1窗口
 input bool               InpEA1BasketProfitCloseEnabled = false; // 源EA1启用跟单篮子整体盈利平仓
 input double             InpEA1BasketProfitClosePoints  = 100.0; // 源EA1篮子均价盈利达到多少点后整篮子平仓
 input int                InpEA1GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
+input double             InpEA1GridSeedPercent = 20.0;         // 网格模式: 首单模式下首单初始跟单比例
 input bool               InpEA1GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
 input double             InpEA1TotalLossMoney    = 100.0;        // 净总浮亏模式: 账户货币浮亏达到该金额后全跟，0=立即
 
 input group "源EA2设置"
 input bool               InpEA2Enabled           = false;        // 启用源EA2
-input long               InpEA2Magic             = 654321;       // 源EA2魔术号，-1表示不限制魔术号
+input long               InpEA2Magic             = -1;       // 源EA2魔术号，-1表示不限制魔术号
 input string             InpEA2CommentFilter     = "";           // 源EA2注释模糊匹配，空表示不限制
 input string             InpEA2AllowedSymbols    = "";           // 源EA2允许品种，多个用;或,分隔，空表示全部
 input ENUM_COPY_ENTRY_MODE InpEA2EntryMode       = ENTRY_MARKET_ON_TRIGGER; // 源EA2入场模式
@@ -244,6 +247,7 @@ input int                InpEA2MinuteCloseEndSecond     = 0;     // 源EA2窗口
 input bool               InpEA2BasketProfitCloseEnabled = false; // 源EA2启用跟单篮子整体盈利平仓
 input double             InpEA2BasketProfitClosePoints  = 100.0; // 源EA2篮子均价盈利达到多少点后整篮子平仓
 input int                InpEA2GridInitialMaxCopies = 1;         // 网格模式: 激活瞬间最多补跟已有源单数，0=不限制
+input double             InpEA2GridSeedPercent = 20.0;         // 网格模式: 首单模式下首单初始跟单比例
 input bool               InpEA2GridStopAfterBasketClose = true;  // 网格模式: 篮子提前平仓后本轮停止跟单
 input double             InpEA2TotalLossMoney    = 100.0;        // 净总浮亏模式: 账户货币浮亏达到该金额后全跟，0=立即
 
@@ -310,6 +314,9 @@ string g_panel_last_action = "就绪";
 string g_round_copy_keys[];
 int g_round_copy_counts[];
 bool g_round_copy_tracking_ready = false;
+bool g_reset_blocked = false;
+bool g_reset_waiting_snapshot = false;
+ulong g_reset_snapshot_sequence = 0;
 ulong g_sender_sequence = 0;
 datetime g_last_debug_print = 0;
 datetime g_last_error_print = 0;
@@ -795,6 +802,7 @@ void LoadProfile(const int index, SourceProfile& profile)
       profile.basket_profit_close_points = InpEA1BasketProfitClosePoints;
       profile.grid_initial_max_copies = InpEA1GridInitialMaxCopies;
       profile.grid_stop_after_basket_close = InpEA1GridStopAfterBasketClose;
+      profile.grid_seed_percent = InpEA1GridSeedPercent;
       profile.total_loss_money = InpEA1TotalLossMoney;
       return;
    }
@@ -841,6 +849,7 @@ void LoadProfile(const int index, SourceProfile& profile)
    profile.basket_profit_close_points = InpEA2BasketProfitClosePoints;
    profile.grid_initial_max_copies = InpEA2GridInitialMaxCopies;
    profile.grid_stop_after_basket_close = InpEA2GridStopAfterBasketClose;
+   profile.grid_seed_percent = InpEA2GridSeedPercent;
    profile.total_loss_money = InpEA2TotalLossMoney;
 }
 
@@ -963,11 +972,19 @@ bool ValidateProfile(const int index, const SourceProfile& profile)
       return false;
    }
 
-   if(profile.entry_mode == ENTRY_GRID_ACTIVATION)
+   if(profile.entry_mode == ENTRY_GRID_ACTIVATION ||
+      profile.entry_mode == ENTRY_GRID_SEED_FIRST)
    {
       if(profile.grid_initial_max_copies < 0)
       {
          PrintFormat("EA%d grid initial max copies cannot be negative.", index);
+         return false;
+      }
+
+      if(profile.entry_mode == ENTRY_GRID_SEED_FIRST &&
+         (profile.grid_seed_percent <= 0.0 || profile.grid_seed_percent > 100.0))
+      {
+         PrintFormat("EA%d grid seed percent must be in (0, 100].", index);
          return false;
       }
 
@@ -1115,6 +1132,9 @@ int InitMemoryReceiver()
       return INIT_FAILED;
    }
 
+   g_reset_blocked = GlobalVariableCheck(ResetBlockGlobalName());
+   if(g_reset_blocked)
+      g_panel_last_action = "上次状态更新未完成，已停开，请空仓后再次更新";
    PanelInitialize();
    LoadMemorySnapshot(true);
    UpdateRoundCopyTracking();
@@ -1168,6 +1188,7 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
       CloseCopiesWithoutSource();
       DeletePendingsWithoutSource();
       ResetInactiveGridGroups();
+      ResetInactiveGridSeedSources();
       ResetInactiveTotalLossGroups();
    }
    PanelUpdate(true);
@@ -1521,6 +1542,9 @@ void PanelInitialize()
    PanelCreateButton("BTN_PAUSE", x + 12, y + 238, 112, 30, "暂停新开", C'184,117,22');
    PanelCreateButton("BTN_CLOSE", x + 139, y + 238, 112, 30, "全部平仓", C'161,52,58');
    PanelCreateButton("BTN_DELETE", x + 266, y + 238, 112, 30, "删除挂单", C'115,68,143');
+   PanelCreateButton("BTN_RESET", x + 393, y + 238, 134, 30, "更新跟单", C'35,94,150');
+   ObjectSetString(0, PanelObjectName("BTN_RESET"), OBJPROP_TOOLTIP,
+                   "仅空仓且无挂单时可更新；清除已跟记录，符合条件的旧源单可能立即重新跟单");
    PanelCreateLabel("ACTION", x + 14, y + 278, "操作：就绪", clrDarkGray, 8);
    PanelCreateLabel("SOURCE_TITLE", x + 14, y + 310, "快照源单明细（当前接收数据）", clrDeepSkyBlue, 9);
    PanelCreateLabel("SOURCE_HEAD", x + 14, y + 331, "序号  方向  品种       手数     开仓价       估算盈亏      源单ID", clrSilver, 8);
@@ -1684,9 +1708,12 @@ void PanelUpdate(const bool force)
    PanelSetLabel("TRADE",
                  "自动交易：" + (IsAlgoTradingAllowed() ? "已开启" : "已关闭"),
                  IsAlgoTradingAllowed() ? clrLimeGreen : clrTomato);
-   PanelSetLabel("PAUSE",
-                 "新开控制：" + (PanelEntriesPaused() ? "已暂停（平仓逻辑继续）" : "正常跟单"),
-                 PanelEntriesPaused() ? clrOrange : clrLimeGreen);
+   string entry_status = g_reset_blocked ? "状态更新未完成（停开）" :
+                         (PanelEntriesPaused() ? "已暂停（平仓逻辑继续）" :
+                         (g_reset_waiting_snapshot ? "更新后等待新快照" : "正常跟单"));
+   PanelSetLabel("PAUSE", "新开控制：" + entry_status,
+                 g_reset_blocked || PanelEntriesPaused() || g_reset_waiting_snapshot
+                 ? clrOrange : clrLimeGreen);
    PanelSetLabel("ACTION", "操作：" + g_panel_last_action, clrDarkGray);
 
    if(g_panel_confirm_action == "CLOSE")
@@ -1698,6 +1725,10 @@ void PanelUpdate(const bool force)
       PanelSetButton("BTN_DELETE", "再次点击确认", C'142,76,177');
    else
       PanelSetButton("BTN_DELETE", "删除挂单", C'115,68,143');
+
+   PanelSetButton("BTN_RESET",
+                  g_panel_confirm_action == "RESET" ? "再次点击确认" : "更新跟单",
+                  g_panel_confirm_action == "RESET" ? C'184,117,22' : C'35,94,150');
 
    PanelSetButton("BTN_PAUSE",
                   PanelEntriesPaused() ? "恢复新开" : "暂停新开",
@@ -1720,8 +1751,219 @@ bool PanelConfirmAction(const string action)
    g_panel_confirm_until_tick_ms = now_tick + 3000;
    g_panel_last_action = action == "CLOSE"
                          ? "3秒内再次点击“全部平仓”确认"
-                         : "3秒内再次点击“删除挂单”确认";
+                         : (action == "RESET"
+                            ? "3秒内再次点击“更新跟单”；旧源单可能立即重新跟单"
+                            : "3秒内再次点击“删除挂单”确认");
    return false;
+}
+
+// Reset touches only cycle state owned by this receiver; position mappings are retained.
+string ResetBlockGlobalName()
+{
+   return "WMLFC_RESET_" + IntegerToString((long)WinApiMemoryNameHash(
+      IntegerToString((long)AccountInfoInteger(ACCOUNT_LOGIN)) + "|" +
+      InpChannelName + "|" + IntegerToString((long)InpCopyMagic)));
+}
+
+bool BlockEntriesForStateChange()
+{
+   g_reset_blocked = true;
+   if(GlobalVariableSet(ResetBlockGlobalName(), 1.0) == 0)
+   {
+      g_panel_last_action = "无法保存停开状态，更新未执行";
+      Print(g_panel_last_action);
+      return false;
+   }
+   GlobalVariablesFlush();
+   return true;
+}
+
+bool IsNumericStateId(const string value)
+{
+   if(StringLen(value) == 0)
+      return false;
+   for(int i = 0; i < StringLen(value); i++)
+   {
+      ushort c = StringGetCharacter(value, i);
+      if(c < '0' || c > '9')
+         return false;
+   }
+   return true;
+}
+
+bool IsCopyLevelStateTail(const string tail)
+{
+   int separator = StringFind(tail, "_L");
+   if(separator <= 0 || !IsNumericStateId(StringSubstr(tail, 0, separator)))
+      return false;
+   string level = StringSubstr(tail, separator + 2);
+   return level == "1" || level == "2" || level == "3" || level == "1_INIT";
+}
+
+bool IsReceiverCycleState(const string name)
+{
+   if(g_prefix == "" || StringFind(name, g_prefix) != 0)
+      return false;
+   if(StringFind(name, GridStatePrefix("A")) == 0 ||
+      StringFind(name, GridStatePrefix("S")) == 0 ||
+      StringFind(name, TotalLossStatePrefix("A")) == 0 ||
+      StringFind(name, TotalLossStatePrefix("S")) == 0)
+      return true;
+   if(StringFind(name, GridSeedStatePrefix()) == 0)
+      return true;
+   string tail = StringSubstr(name, StringLen(g_prefix));
+   if(StringFind(tail, "PARTIAL_") == 0)
+      tail = StringSubstr(tail, StringLen("PARTIAL_"));
+   return IsCopyLevelStateTail(tail);
+}
+
+bool ResetHasCopyExposure()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket))
+         return true;
+      if((ulong)PositionGetInteger(POSITION_MAGIC) == InpCopyMagic || IsCopyPosition())
+         return true;
+   }
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0 || !OrderSelect(ticket))
+         return true;
+      if((ulong)OrderGetInteger(ORDER_MAGIC) == InpCopyMagic)
+         return true;
+   }
+   return false;
+}
+
+void PanelResetFollowing()
+{
+   // Recheck on the confirmed click. Never close positions or remove orders here.
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))
+   {
+      g_panel_last_action = "更新未执行：交易终端未连接";
+      return;
+   }
+   if(ResetHasCopyExposure())
+   {
+      g_panel_last_action = "更新未执行：请先清空本EA持仓和挂单";
+      return;
+   }
+   if(!LoadMemorySnapshot(true))
+   {
+      g_panel_last_action = "更新未执行：源端快照不可用或已暂停";
+      return;
+   }
+   if(!BlockEntriesForStateChange())
+      return;
+
+   int removed = 0;
+   int failed = 0;
+   for(int i = GlobalVariablesTotal() - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      if(!IsReceiverCycleState(name))
+         continue;
+      if(GlobalVariableDel(name))
+         removed++;
+      else
+         failed++;
+   }
+   GlobalVariablesFlush();
+
+   // An interrupted/failed reset remains blocked across EA restarts.
+   if(failed > 0)
+   {
+      g_panel_last_action = "更新失败：状态清理不完整，已停开，请再次更新";
+      PrintFormat("Following reset incomplete. removed=%d failed=%d", removed, failed);
+      return;
+   }
+
+   ArrayResize(g_round_copy_keys, 0);
+   ArrayResize(g_round_copy_counts, 0);
+   g_round_copy_tracking_ready = false;
+   ArrayResize(g_missing_source_confirmations, 0);
+   g_last_first_entry_time_filter_log = 0;
+   UpdateRoundCopyTracking();
+
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED) ||
+      ResetHasCopyExposure() || !LoadMemorySnapshot(true))
+   {
+      g_panel_last_action = "状态已清理，但复核未通过，已停开，请再次更新";
+      return;
+   }
+   if(!GlobalVariableDel(ResetBlockGlobalName()))
+   {
+      g_panel_last_action = "更新失败：无法解除停开状态，请再次更新";
+      return;
+   }
+   GlobalVariablesFlush();
+   g_reset_blocked = false;
+   g_reset_snapshot_sequence = g_snapshot_sequence;
+   g_reset_waiting_snapshot = true;
+   g_panel_last_action = g_panel_entries_paused
+                         ? "更新完成，保持暂停；恢复新开后重新判断源单"
+                         : "更新完成，等待新快照；满足条件将重新跟单";
+   PrintFormat("Following reset completed. channel=%s magic=%I64u removed=%d paused=%s",
+               InpChannelName, (ulong)InpCopyMagic, removed,
+               g_panel_entries_paused ? "true" : "false");
+}
+
+string GridInitialSourceName(const ulong source_ticket)
+{
+   return CopyGlobalName(source_ticket, 1) + "_INIT";
+}
+
+bool IsGridInitialSourceSkipped(const ulong source_ticket)
+{
+   string name = GridInitialSourceName(source_ticket);
+   return GlobalVariableCheck(name) && GlobalVariableGet(name) < 0.5;
+}
+
+// Reserve the initial source set BEFORE sending any order. Failures retry the
+// same selected sources; later arrivals (without a decision) remain eligible.
+bool PrepareGridInitialSources(const SourceProfile& profile,
+                               const string symbol,
+                               const ENUM_POSITION_TYPE position_type)
+{
+   int selected = 0;
+   for(int i = ArraySize(g_sources) - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type)
+         continue;
+      string name = GridInitialSourceName(source.source_id);
+      if((GlobalVariableCheck(name) && GlobalVariableGet(name) > 0.5) ||
+         IsAlreadyCopied(source.source_id, 1))
+         selected++;
+   }
+
+   for(int i = ArraySize(g_sources) - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type)
+         continue;
+      string name = GridInitialSourceName(source.source_id);
+      if(GlobalVariableCheck(name) || IsAlreadyCopied(source.source_id, 1))
+         continue;
+      bool eligible = profile.grid_initial_max_copies <= 0 ||
+                      selected < profile.grid_initial_max_copies;
+      if(GlobalVariableSet(name, eligible ? 1.0 : 0.0) == 0)
+      {
+         BlockEntriesForStateChange();
+         g_panel_last_action = "网格初始名单保存失败，已停开，请空仓后更新";
+         Print(g_panel_last_action);
+         return false;
+      }
+      if(eligible)
+         selected++;
+   }
+   GlobalVariablesFlush();
+   return true;
 }
 
 void PanelCloseAllCopies()
@@ -1796,6 +2038,11 @@ void PanelHandleChartEvent(const int event_id, const string object_name)
       if(PanelConfirmAction("CLOSE"))
          PanelCloseAllCopies();
    }
+   else if(object_name == PanelObjectName("BTN_RESET"))
+   {
+      if(PanelConfirmAction("RESET"))
+         PanelResetFollowing();
+   }
    else if(object_name == PanelObjectName("BTN_DELETE"))
    {
       if(PanelConfirmAction("DELETE"))
@@ -1810,6 +2057,8 @@ void PanelHandleChartEvent(const int event_id, const string object_name)
 void CheckPositions()
 {
    bool fresh = LoadMemorySnapshot(false);
+   if(g_reset_waiting_snapshot && fresh && g_snapshot_sequence != g_reset_snapshot_sequence)
+      g_reset_waiting_snapshot = false;
    PanelUpdate(false);
 
    if(InpCloseCopyWithSource && fresh)
@@ -1824,6 +2073,7 @@ void CheckPositions()
    if(fresh)
    {
       ResetInactiveGridGroups();
+      ResetInactiveGridSeedSources();
       ResetInactiveTotalLossGroups();
    }
 
@@ -1837,10 +2087,12 @@ void CheckPositions()
    if(!fresh)
       return;
 
-   if(PanelEntriesPaused())
+   if(g_reset_blocked || g_reset_waiting_snapshot || PanelEntriesPaused())
       return;
 
    CheckGridActivationEntries();
+   if(g_reset_blocked)
+      return;
    CheckTotalLossActivationEntries();
 
    int total = ArraySize(g_sources);
@@ -1855,7 +2107,8 @@ void CheckPositions()
       if(!MatchSourceProfile(source_symbol, magic, comment, profile))
          continue;
 
-      if(profile.entry_mode == ENTRY_GRID_ACTIVATION ||
+      if((profile.entry_mode == ENTRY_GRID_ACTIVATION ||
+          profile.entry_mode == ENTRY_GRID_SEED_FIRST) ||
          profile.entry_mode == ENTRY_TOTAL_FLOATING_LOSS)
          continue;
 
@@ -1885,7 +2138,8 @@ void CheckGridActivationEntries()
       if(!MatchSourceProfile(symbol, source.magic, comment, profile))
          continue;
 
-      if(profile.entry_mode != ENTRY_GRID_ACTIVATION)
+      if(profile.entry_mode != ENTRY_GRID_ACTIVATION &&
+         profile.entry_mode != ENTRY_GRID_SEED_FIRST)
          continue;
 
       ENUM_POSITION_TYPE position_type = source.position_type;
@@ -1901,6 +2155,8 @@ void CheckGridActivationEntries()
       AddString(processed_keys, key);
 
       ProcessGridGroup(profile, symbol, position_type);
+      if(g_reset_blocked)
+         return;
    }
 }
 
@@ -2095,10 +2351,123 @@ void CopyTotalLossSources(const SourceProfile& profile,
    }
 }
 
+void ProcessGridSeedFirstGroup(const SourceProfile& profile,
+                              const string symbol,
+                              const ENUM_POSITION_TYPE position_type)
+{
+   string local_symbol = LocalSymbolForSource(symbol);
+   if(!EnsureSymbolReady(local_symbol))
+      return;
+   if(IsGridGroupStopped(profile.profile_index, symbol, position_type))
+      return;
+
+   MemorySourcePosition first_source;
+   bool have_first = false;
+   for(int i = 0; i < ArraySize(g_sources); i++)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type)
+         continue;
+      if(!have_first || source.open_time < first_source.open_time ||
+         (source.open_time == first_source.open_time && source.source_id < first_source.source_id))
+      {
+         first_source = source;
+         have_first = true;
+      }
+   }
+
+   if(!have_first)
+   {
+      ClearGridSeedSource(profile.profile_index, symbol, position_type);
+      return;
+   }
+
+   ulong seed_ticket = GridSeedSource(profile.profile_index, symbol, position_type);
+   MemorySourcePosition seed_source;
+   bool valid_seed = seed_ticket > 0 && MemorySourceById(seed_ticket, seed_source) &&
+                     IsSourcePositionForProfile(profile, seed_source) &&
+                     seed_source.symbol == symbol &&
+                     seed_source.position_type == position_type;
+   if(!valid_seed)
+   {
+      seed_ticket = first_source.source_id;
+      seed_source = first_source;
+      SetGridSeedSource(profile.profile_index, symbol, position_type, seed_ticket);
+   }
+
+   double loss_points = FloatingLossPoints(local_symbol, seed_source.position_type, seed_source.open_price);
+   double loss_price = loss_points * SymbolInfoDouble(local_symbol, SYMBOL_POINT);
+   bool triggered = IsLossTriggered(loss_points, loss_price, profile, 1);
+   double full_volume = CalculateCopyVolume(local_symbol, seed_source.volume, profile, 1);
+   double target_volume = triggered
+                          ? full_volume
+                          : NormalizeVolume(local_symbol, full_volume * profile.grid_seed_percent / 100.0);
+   double copied_volume = CopyVolumeForSourceLevel(seed_ticket, 1);
+   double delta = target_volume - copied_volume;
+   double step = SymbolInfoDouble(local_symbol, SYMBOL_VOLUME_STEP);
+
+   if(delta > 0.0 && (step <= 0.0 || delta >= step * 0.01))
+   {
+      double request_volume = NormalizeVolume(local_symbol, delta);
+      request_volume = PartialRetryVolume(local_symbol, seed_ticket, 1, request_volume);
+      if(request_volume > 0.0 && !IsFirstCopyEntryTimeBlocked())
+      {
+         if(OpenCopyTrade(seed_ticket,
+                          local_symbol,
+                          seed_source.position_type,
+                          request_volume,
+                          seed_source.sl,
+                          seed_source.tp,
+                          loss_points,
+                          loss_price,
+                          profile,
+                          1) && triggered)
+            MarkCopied(seed_ticket, 1);
+      }
+   }
+
+   for(int i = ArraySize(g_sources) - 1; i >= 0; i--)
+   {
+      MemorySourcePosition source = g_sources[i];
+      if(!IsSourcePositionForProfile(profile, source) ||
+         source.symbol != symbol || source.position_type != position_type ||
+         source.source_id == seed_ticket)
+         continue;
+      if(IsAlreadyCopied(source.source_id, 1))
+         continue;
+
+      double volume = CalculateCopyVolume(local_symbol, source.volume, profile, 1);
+      volume = PartialRetryVolume(local_symbol, source.source_id, 1, volume);
+      if(volume <= 0.0 || IsFirstCopyEntryTimeBlocked())
+         continue;
+
+      double source_loss_points = FloatingLossPoints(local_symbol, source.position_type, source.open_price);
+      double source_loss_price = source_loss_points * SymbolInfoDouble(local_symbol, SYMBOL_POINT);
+      if(OpenCopyTrade(source.source_id,
+                       local_symbol,
+                       source.position_type,
+                       volume,
+                       source.sl,
+                       source.tp,
+                       source_loss_points,
+                       source_loss_price,
+                       profile,
+                       1))
+         MarkCopied(source.source_id, 1);
+   }
+}
+
 void ProcessGridGroup(const SourceProfile& profile,
                       const string symbol,
                       const ENUM_POSITION_TYPE position_type)
 {
+   if(profile.entry_mode == ENTRY_GRID_SEED_FIRST)
+   {
+      ProcessGridSeedFirstGroup(profile, symbol, position_type);
+      return;
+   }
+
    string local_symbol = LocalSymbolForSource(symbol);
    if(!EnsureSymbolReady(local_symbol))
    {
@@ -2145,6 +2514,8 @@ void ProcessGridGroup(const SourceProfile& profile,
          return;
       }
 
+      if(!PrepareGridInitialSources(profile, symbol, position_type))
+         return;
       SetGridGroupActive(profile.profile_index, symbol, position_type);
       if(InpPrintDebug)
       {
@@ -2157,11 +2528,11 @@ void ProcessGridGroup(const SourceProfile& profile,
                      loss_price);
       }
 
-      CopyGridSources(profile, symbol, local_symbol, position_type, true, loss_points, loss_price);
+      CopyGridSources(profile, symbol, local_symbol, position_type, loss_points, loss_price);
       return;
    }
 
-   CopyGridSources(profile, symbol, local_symbol, position_type, false, loss_points, loss_price);
+   CopyGridSources(profile, symbol, local_symbol, position_type, loss_points, loss_price);
 }
 
 bool SourceGroupStats(const SourceProfile& profile,
@@ -2219,11 +2590,9 @@ void CopyGridSources(const SourceProfile& profile,
                      const string symbol,
                      const string local_symbol,
                      const ENUM_POSITION_TYPE position_type,
-                     const bool initial_activation,
                      const double group_loss_points,
                      const double group_loss_price)
 {
-   int copied_now = 0;
    int total = ArraySize(g_sources);
 
    for(int i = total - 1; i >= 0; i--)
@@ -2243,8 +2612,8 @@ void CopyGridSources(const SourceProfile& profile,
       if(IsAlreadyCopied(source_ticket, 1))
          continue;
 
-      if(initial_activation && profile.grid_initial_max_copies > 0 && copied_now >= profile.grid_initial_max_copies)
-         return;
+      if(IsGridInitialSourceSkipped(source_ticket))
+         continue;
 
       double source_volume = source.volume;
    double volume = CalculateCopyVolume(local_symbol, source_volume, profile, 1);
@@ -2272,11 +2641,26 @@ void CopyGridSources(const SourceProfile& profile,
       }
 
       if(OpenCopyTrade(source_ticket, local_symbol, position_type, volume, source_sl, source_tp, group_loss_points, group_loss_price, profile, 1))
-      {
          MarkCopied(source_ticket, 1);
-         copied_now++;
-      }
    }
+}
+
+double CopyVolumeForSourceLevel(const ulong source_ticket, const int level_index)
+{
+   double total_volume = 0.0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong copy_ticket = PositionGetTicket(i);
+      if(copy_ticket == 0 || !PositionSelectByTicket(copy_ticket))
+         continue;
+      if(!IsCopyPosition())
+         continue;
+      if(SourceTicketFromCurrentPosition() != source_ticket ||
+         CopyLevelFromCurrentPosition() != level_index)
+         continue;
+      total_volume += PositionGetDouble(POSITION_VOLUME);
+   }
+   return total_volume;
 }
 
 int CopyGroupCount(const int profile_index,
@@ -2876,7 +3260,8 @@ void CheckBasketProfitClose()
                      profile.basket_profit_close_points);
       }
 
-      if(profile.entry_mode == ENTRY_GRID_ACTIVATION && profile.grid_stop_after_basket_close)
+      if((profile.entry_mode == ENTRY_GRID_ACTIVATION ||
+          profile.entry_mode == ENTRY_GRID_SEED_FIRST) && profile.grid_stop_after_basket_close)
          SetGridGroupStopped(profile.profile_index, symbol, position_type);
 
       CloseBasketPositions(profile.profile_index, symbol, position_type);
@@ -3214,6 +3599,101 @@ void UpdateRoundCopyTracking()
       g_round_copy_counts[i] = current_counts[i];
    }
    g_round_copy_tracking_ready = true;
+}
+
+string GridSeedStatePrefix()
+{
+   return g_prefix + "SEED_";
+}
+
+string GridSeedSourceName(const int profile_index,
+                          const string symbol,
+                          const ENUM_POSITION_TYPE position_type)
+{
+   return GridSeedStatePrefix() +
+          IntegerToString(profile_index) + "_" +
+          IntegerToString((int)position_type) + "_" +
+          symbol;
+}
+
+ulong GridSeedSource(const int profile_index,
+                    const string symbol,
+                    const ENUM_POSITION_TYPE position_type)
+{
+   string name = GridSeedSourceName(profile_index, symbol, position_type);
+   if(!GlobalVariableCheck(name))
+      return 0;
+   return (ulong)GlobalVariableGet(name);
+}
+
+void SetGridSeedSource(const int profile_index,
+                       const string symbol,
+                       const ENUM_POSITION_TYPE position_type,
+                       const ulong source_id)
+{
+   if(source_id > 0)
+      GlobalVariableSet(GridSeedSourceName(profile_index, symbol, position_type), (double)source_id);
+}
+
+void ClearGridSeedSource(const int profile_index,
+                         const string symbol,
+                         const ENUM_POSITION_TYPE position_type)
+{
+   GlobalVariableDel(GridSeedSourceName(profile_index, symbol, position_type));
+}
+
+bool ParseGridSeedStateName(const string name,
+                            int& profile_index,
+                            string& symbol,
+                            ENUM_POSITION_TYPE& position_type)
+{
+   string prefix = GridSeedStatePrefix();
+   if(StringFind(name, prefix) != 0)
+      return false;
+
+   string tail = StringSubstr(name, StringLen(prefix));
+   int first = StringFind(tail, "_");
+   if(first <= 0)
+      return false;
+   int second = StringFind(tail, "_", first + 1);
+   if(second <= first + 1 || second >= StringLen(tail) - 1)
+      return false;
+
+   profile_index = (int)StringToInteger(StringSubstr(tail, 0, first));
+   position_type = (ENUM_POSITION_TYPE)StringToInteger(StringSubstr(tail, first + 1, second - first - 1));
+   symbol = StringSubstr(tail, second + 1);
+   return profile_index > 0 && profile_index <= 2 &&
+          (position_type == POSITION_TYPE_BUY || position_type == POSITION_TYPE_SELL) &&
+          symbol != "";
+}
+
+void ResetInactiveGridSeedSources()
+{
+   string prefix = GridSeedStatePrefix();
+   int total = GlobalVariablesTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      string name = GlobalVariableName(i);
+      if(StringFind(name, prefix) != 0)
+         continue;
+
+      int profile_index = 0;
+      string symbol = "";
+      ENUM_POSITION_TYPE position_type = POSITION_TYPE_BUY;
+      if(!ParseGridSeedStateName(name, profile_index, symbol, position_type))
+         continue;
+
+      SourceProfile profile;
+      LoadProfile(profile_index, profile);
+      int source_count = 0;
+      double source_volume = 0.0;
+      double weighted_open = 0.0;
+      if(profile.enabled &&
+         SourceGroupStats(profile, symbol, position_type, source_count, source_volume, weighted_open))
+         continue;
+
+      GlobalVariableDel(name);
+   }
 }
 
 string GridStatePrefix(const string state)

@@ -25,6 +25,64 @@ def function_body(source: str, signature: str) -> str:
     raise AssertionError(f"unbalanced function: {signature}")
 
 
+def code_only(source: str) -> str:
+    """Remove comments and string/character literals for delimiter checks."""
+    out = []
+    i = 0
+    state = "code"
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if state == "code":
+            if ch == "/" and nxt == "/":
+                out.extend("  ")
+                i += 2
+                state = "line"
+                continue
+            if ch == "/" and nxt == "*":
+                out.extend("  ")
+                i += 2
+                state = "block"
+                continue
+            if ch in ('"', "'"):
+                out.append(" ")
+                state = ch
+                i += 1
+                continue
+            out.append(ch)
+            i += 1
+            continue
+        if state == "line":
+            if ch == "\n":
+                out.append("\n")
+                state = "code"
+            else:
+                out.append(" ")
+            i += 1
+            continue
+        if state == "block":
+            if ch == "*" and nxt == "/":
+                out.extend("  ")
+                i += 2
+                state = "code"
+            else:
+                out.append("\n" if ch == "\n" else " ")
+                i += 1
+            continue
+        # string or character literal
+        if ch == "\\":
+            out.extend("  ")
+            i += 2
+        elif ch == state:
+            out.append(" ")
+            i += 1
+            state = "code"
+        else:
+            out.append("\n" if ch == "\n" else " ")
+            i += 1
+    return "".join(out)
+
+
 class LossFollowVariantTests(unittest.TestCase):
     def test_each_variant_has_separate_trade_outcome_policies(self):
         for filename in VARIANTS:
@@ -67,14 +125,47 @@ class LossFollowVariantTests(unittest.TestCase):
             self.assertIn("GlobalVariableDel(name)", cleanup, filename)
             self.assertIn("CleanupFinishedCopyState();", function_body(source, "void CheckPositions("), filename)
 
+    def test_seed_first_mode_is_wired_in_all_variants(self):
+        for filename in VARIANTS:
+            source = (ROOT / filename).read_text()
+            self.assertIn("ENTRY_GRID_SEED_FIRST", source, filename)
+            self.assertIn("double grid_seed_percent;", source, filename)
+            self.assertIn("InpEA1GridSeedPercent = 20.0", source, filename)
+            self.assertIn("InpEA2GridSeedPercent = 20.0", source, filename)
+            self.assertIn("profile.grid_seed_percent = InpEA1GridSeedPercent", source, filename)
+            self.assertIn("profile.grid_seed_percent = InpEA2GridSeedPercent", source, filename)
+            self.assertIn("grid_seed_percent <= 0.0 || profile.grid_seed_percent > 100.0", source, filename)
+            self.assertIn("void ProcessGridSeedFirstGroup(", source, filename)
+            self.assertIn("double CopyVolumeForSourceLevel(", source, filename)
+            self.assertIn("ulong GridSeedSource(", source, filename)
+            self.assertIn("void ResetInactiveGridSeedSources()", source, filename)
+            check = function_body(source, "void CheckPositions(")
+            self.assertIn("ResetInactiveGridSeedSources();", check, filename)
+
+            # The defaults mean every source magic is accepted unless the user narrows it.
+            self.assertRegex(source, r"InpEA1Magic\s*=\s*-1\s*;", filename)
+            self.assertRegex(source, r"InpEA2Magic\s*=\s*-1\s*;", filename)
+
+            grid = function_body(source, "void ProcessGridSeedFirstGroup(")
+            self.assertIn("target_volume = triggered", grid, filename)
+            self.assertIn("full_volume * profile.grid_seed_percent / 100.0", grid, filename)
+            self.assertIn("double delta = target_volume - copied_volume", grid, filename)
+            self.assertIn("if(IsAlreadyCopied(source", grid, filename)
+            self.assertIn("CalculateCopyVolume", grid, filename)
+            self.assertIn("IsGridGroupStopped(profile.profile_index, symbol, position_type)", grid, filename)
+
+            process_grid = function_body(source, "void ProcessGridGroup(")
+            self.assertIn("ProcessGridSeedFirstGroup(profile, symbol, position_type);", process_grid, filename)
+
     def test_source_text_is_balanced_and_functions_are_unique(self):
         signatures = [
             r"\b(?:bool|void|double|string|uint)\s+(?:OpenCopyTrade|CloseCopyPosition|IsAlreadyCopied|CleanupFinishedCopyState|PartialRetryVolume|LossFollowNameHash)\s*\(",
         ]
         for filename in VARIANTS:
             source = (ROOT / filename).read_text()
-            self.assertEqual(source.count("{"), source.count("}"), filename)
-            self.assertEqual(source.count("("), source.count(")"), filename)
+            stripped = code_only(source)
+            self.assertEqual(stripped.count("{"), stripped.count("}"), filename)
+            self.assertEqual(stripped.count("("), stripped.count(")"), filename)
             for pattern in signatures:
                 matches = re.findall(pattern, source)
                 self.assertEqual(len(matches), len(set(matches)), filename)
